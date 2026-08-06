@@ -18,6 +18,7 @@ import (
 //     max_tokens→length、其余→stop）；usage → 并入最近一个已输出的 chunk，
 //     若从未输出 chunk 则吞掉；
 //   - ping/stats/未知事件吞掉；thinking/redacted_thinking 块完全剥离；
+//   - error 事件 → 返回 error 终止流（不伪造 [DONE]）；
 //   - message_stop → 无输出；Close() 返回 data: [DONE]\n\n。
 type C2OStream struct {
 	id        string
@@ -57,11 +58,23 @@ func (s *C2OStream) Write(frame []byte) ([][]byte, error) {
 	case EventMessageStart:
 		// 首个 chunk：role=assistant、content=""（finish_reason 缺失即 null）
 		return [][]byte{s.chunk(StreamChoice{Delta: ChatMessage{Role: "assistant", Content: ""}})}, nil
-	case EventPing, EventError, EventContentBlockStop:
+	case EventPing, EventContentBlockStop:
 		// content_block_stop 同时复位 inTool，保证块切换后（tool_use → text）
 		// 后续 text_delta 不被误吞。
 		s.inTool = false
 		return nil, nil
+	case EventError:
+		// 上游错误事件：立即终止流（返回 error）。readClaudeFrames 收到 error
+		// 后不再回调 onDone，因此下游拿不到 [DONE]/finish_reason——绝不把
+		// 截断的流伪装成成功（spec §5 "不伪造结束事件"）。
+		var ev StreamEvent
+		if err := json.Unmarshal(data, &ev); err != nil {
+			return nil, fmt.Errorf("upstream stream error (unparseable payload)")
+		}
+		if ev.Error != nil && ev.Error.Message != "" {
+			return nil, fmt.Errorf("upstream stream error: %s", ev.Error.Message)
+		}
+		return nil, fmt.Errorf("upstream stream error")
 	case EventContentBlockStart:
 		var ev StreamEvent
 		if err := json.Unmarshal(data, &ev); err != nil {
@@ -116,19 +129,17 @@ func (s *C2OStream) Write(frame []byte) ([][]byte, error) {
 		}
 		return nil, nil
 	case EventMessageDelta:
-		// 真实 Claude 帧中 stop_reason 嵌套在 delta 内（StreamEvent.StopReason 在顶层，
-		// 无法接收），此处用局部结构精确捕获 delta.stop_reason 与顶层 usage。
+		// 真实 Claude 帧中 stop_reason 嵌套在 delta 内（顶层 stop_reason 无值），
+		// 复用扩展后的 ClaudeDelta 精确捕获 delta.stop_reason 与顶层 usage。
 		var ev struct {
-			Delta struct {
-				StopReason *string `json:"stop_reason"`
-			} `json:"delta"`
+			Delta *ClaudeDelta `json:"delta"`
 			Usage *ClaudeUsage `json:"usage"`
 		}
 		if err := json.Unmarshal(data, &ev); err != nil {
 			return nil, err
 		}
 		var out [][]byte
-		if ev.Delta.StopReason != nil {
+		if ev.Delta != nil && ev.Delta.StopReason != nil {
 			fr := finishReasonC2O(*ev.Delta.StopReason)
 			out = append(out, s.chunk(StreamChoice{FinishReason: &fr}))
 		}

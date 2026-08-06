@@ -58,15 +58,18 @@ type ClaudeTool struct {
 	InputSchema map[string]any `json:"input_schema"`
 }
 
+// MessagesResponse 的 stop_reason/stop_sequence 不设 omitempty：
+// 真实 Anthropic 响应（含 message_start 帧）总是携带这两个字段（值为 null 或字符串）。
 type MessagesResponse struct {
-	ID         string        `json:"id"`
-	Type       string        `json:"type"`
-	Role       string        `json:"role"`
-	Model      string        `json:"model"`
-	Content    []ClaudeBlock `json:"content"`
-	StopReason *string       `json:"stop_reason,omitempty"`
-	Usage      *ClaudeUsage  `json:"usage,omitempty"`
-	Error      *ClaudeError  `json:"error,omitempty"`
+	ID           string        `json:"id"`
+	Type         string        `json:"type"`
+	Role         string        `json:"role"`
+	Model        string        `json:"model"`
+	Content      []ClaudeBlock `json:"content"`
+	StopReason   *string       `json:"stop_reason"`
+	StopSequence *string       `json:"stop_sequence"`
+	Usage        *ClaudeUsage  `json:"usage,omitempty"`
+	Error        *ClaudeError  `json:"error,omitempty"`
 }
 
 type ClaudeUsage struct {
@@ -91,8 +94,14 @@ type StreamEvent struct {
 	Error        *ClaudeError      `json:"error,omitempty"`
 }
 
+// ClaudeDelta 同时服务两类 delta：
+//   - content_block_delta：type/text/partial_json（type 恒有值）；
+//   - message_delta 的嵌套 delta：stop_reason/stop_sequence（type 缺省，
+//     omitempty 保证空 delta 序列化为 {}）。
 type ClaudeDelta struct {
-	Type        string `json:"type"`
-	Text        string `json:"text,omitempty"`
-	PartialJSON string `json:"partial_json,omitempty"`
+	Type         string  `json:"type,omitempty"`
+	Text         string  `json:"text,omitempty"`
+	PartialJSON  string  `json:"partial_json,omitempty"`
+	StopReason   *string `json:"stop_reason,omitempty"`
+	StopSequence *string `json:"stop_sequence,omitempty"`
 }

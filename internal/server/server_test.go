@@ -235,6 +235,183 @@ func TestInvalidJSON(t *testing.T) {
 	}
 }
 
+// Important 4: 401/400/413 错误必须以入站协议信封返回（Content-Type: application/json）。
+func TestErrorEnvelope_OpenAI401(t *testing.T) {
+	cfg := &config.Config{
+		Server: config.ServerConfig{AuthKeys: []string{"sk-proxy-1"}},
+		Upstreams: map[string]config.UpstreamConfig{
+			"main": {BaseURL: "http://127.0.0.1:1", APIKey: "sk", Format: "openai", Model: "gpt-4o"},
+		},
+	}
+	srv := NewWithConfig(cfg, upstream.NewClient(), slog.Default())
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+	resp, err := http.Post(ts.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"messages":[]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 401 {
+		t.Fatalf("status: %d", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+		t.Fatalf("content-type: %q", ct)
+	}
+	var out struct {
+		Error struct {
+			Message string `json:"message"`
+			Type    string `json:"type"`
+		} `json:"error"`
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if err := json.Unmarshal(body, &out); err != nil {
+		t.Fatalf("openai envelope: %v (%s)", err, body)
+	}
+	if out.Error.Message == "" || out.Error.Type != "authentication_error" {
+		t.Fatalf("envelope: %+v", out)
+	}
+}
+
+func TestErrorEnvelope_Claude401(t *testing.T) {
+	cfg := &config.Config{
+		Server: config.ServerConfig{AuthKeys: []string{"sk-proxy-1"}},
+		Upstreams: map[string]config.UpstreamConfig{
+			"main": {BaseURL: "http://127.0.0.1:1", APIKey: "sk", Format: "claude", Model: "claude-3"},
+		},
+	}
+	srv := NewWithConfig(cfg, upstream.NewClient(), slog.Default())
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+	resp, err := http.Post(ts.URL+"/v1/messages", "application/json", strings.NewReader(`{"messages":[]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 401 {
+		t.Fatalf("status: %d", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+		t.Fatalf("content-type: %q", ct)
+	}
+	var out struct {
+		Type  string `json:"type"`
+		Error struct {
+			Type    string `json:"type"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if err := json.Unmarshal(body, &out); err != nil {
+		t.Fatalf("claude envelope: %v (%s)", err, body)
+	}
+	if out.Type != "error" || out.Error.Type != "authentication_error" || out.Error.Message == "" {
+		t.Fatalf("envelope: %+v", out)
+	}
+}
+
+func TestErrorEnvelope_OpenAI400(t *testing.T) {
+	cfg := &config.Config{
+		Upstreams: map[string]config.UpstreamConfig{
+			// claude 格式上游：触发 O2C 请求转换路径，n>1 在 OpenAIRequestToClaude 被拒绝
+			"main": {BaseURL: "http://127.0.0.1:1", APIKey: "sk", Format: "claude", Model: "claude-3"},
+		},
+	}
+	srv := NewWithConfig(cfg, upstream.NewClient(), slog.Default())
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+	// n>1 拒绝 → 400（OpenAIRequestToClaude 错误经 400 路径）
+	resp, err := http.Post(ts.URL+"/v1/chat/completions", "application/json",
+		strings.NewReader(`{"messages":[],"n":2}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 400 {
+		t.Fatalf("status: %d", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+		t.Fatalf("content-type: %q", ct)
+	}
+	var out struct {
+		Error struct {
+			Message string `json:"message"`
+			Type    string `json:"type"`
+		} `json:"error"`
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if err := json.Unmarshal(body, &out); err != nil {
+		t.Fatalf("envelope: %v (%s)", err, body)
+	}
+	if out.Error.Message == "" || out.Error.Type != "invalid_request_error" {
+		t.Fatalf("envelope: %+v", out)
+	}
+}
+
+func TestErrorEnvelope_Claude400(t *testing.T) {
+	cfg := &config.Config{
+		Upstreams: map[string]config.UpstreamConfig{
+			"main": {BaseURL: "http://127.0.0.1:1", APIKey: "sk", Format: "claude", Model: "claude-3"},
+		},
+	}
+	srv := NewWithConfig(cfg, upstream.NewClient(), slog.Default())
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+	resp, err := http.Post(ts.URL+"/v1/messages", "application/json", strings.NewReader(`not json`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 400 {
+		t.Fatalf("status: %d", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+		t.Fatalf("content-type: %q", ct)
+	}
+	var out struct {
+		Type  string `json:"type"`
+		Error struct {
+			Type    string `json:"type"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if err := json.Unmarshal(body, &out); err != nil {
+		t.Fatalf("claude envelope: %v (%s)", err, body)
+	}
+	if out.Type != "error" || out.Error.Type != "invalid_request_error" || out.Error.Message == "" {
+		t.Fatalf("envelope: %+v", out)
+	}
+}
+
+func TestErrorEnvelope_413(t *testing.T) {
+	srv := NewWithConfig(&config.Config{Upstreams: map[string]config.UpstreamConfig{
+		"main": {BaseURL: "http://127.0.0.1:1", APIKey: "sk", Format: "openai", Model: "gpt-4o"},
+	}}, upstream.NewClient(), slog.Default())
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+	big := strings.Repeat("x", maxBody+1)
+	resp, err := http.Post(ts.URL+"/v1/chat/completions", "application/json", strings.NewReader(big))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status: %d", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+		t.Fatalf("content-type: %q", ct)
+	}
+	var out struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if err := json.Unmarshal(body, &out); err != nil || out.Error.Message == "" {
+		t.Fatalf("envelope: %v (%s)", err, body)
+	}
+}
+
 func TestAuth_ClaudePath(t *testing.T) {
 	upstreamSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(200)

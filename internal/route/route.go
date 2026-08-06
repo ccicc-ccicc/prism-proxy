@@ -12,6 +12,7 @@ type Decision struct {
 	Upstream     string
 	Model        string
 	VisionSwitch bool
+	HasImage     bool // 入站请求是否含图（spec §7：命中但不切换时日志标记 image_detected）
 }
 
 // Decide 按 spec §4 两条规则决策，忽略请求模型名。
@@ -22,10 +23,10 @@ func Decide(cfg *config.Config, format string, body []byte) (Decision, error) {
 	}
 	if hasImage && cfg.AutoSwitchVision {
 		if vision, ok := cfg.Vision(); ok {
-			return Decision{Upstream: "vision", Model: vision.Model, VisionSwitch: true}, nil
+			return Decision{Upstream: "vision", Model: vision.Model, VisionSwitch: true, HasImage: true}, nil
 		}
 	}
-	return Decision{Upstream: "main", Model: cfg.Main().Model}, nil
+	return Decision{Upstream: "main", Model: cfg.Main().Model, HasImage: hasImage}, nil
 }
 
 // RequestHasImage 结构化检测入站请求是否含图片（递归 tool_result）。

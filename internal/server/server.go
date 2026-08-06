@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"prism-proxy/internal/config"
+	"prism-proxy/internal/convert"
 	"prism-proxy/internal/route"
 	"prism-proxy/internal/upstream"
 )
@@ -57,29 +59,64 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	cfg := s.cfg.Get()
 	if !s.authenticated(r, format, cfg) {
-		http.Error(w, `{"error":{"message":"invalid api key","type":"authentication_error"}}`, http.StatusUnauthorized)
+		writeError(w, format, http.StatusUnauthorized, "invalid api key")
 		return
 	}
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxBody+1))
 	if err != nil {
-		http.Error(w, "read body", http.StatusBadRequest)
+		writeError(w, format, http.StatusBadRequest, "read body: "+err.Error())
 		return
 	}
 	if len(body) > maxBody {
-		http.Error(w, "request too large", http.StatusRequestEntityTooLarge)
+		writeError(w, format, http.StatusRequestEntityTooLarge, "request too large")
 		return
 	}
 	decision, err := route.Decide(cfg, format, body)
 	if err != nil {
-		http.Error(w, "invalid request: "+err.Error(), http.StatusBadRequest)
+		writeError(w, format, http.StatusBadRequest, "invalid request: "+err.Error())
 		return
 	}
 	if err := s.relay(w, r, cfg, format, body, decision); err != nil {
-		// 请求解析/转换失败：未写入任何响应，回 400
-		s.log(start, format, decision, cfg.Upstreams[decision.Upstream], http.StatusBadRequest, false, err)
-		http.Error(w, "invalid request: "+err.Error(), http.StatusBadRequest)
+		// 请求转换失败回 400；上游来源失败回 502（读取/解析上游响应）；
+		// 上游响应超限回 413。错误信封一律用入站格式（writeError）。
+		status := http.StatusBadRequest
+		switch {
+		case errors.Is(err, errResponseTooLarge):
+			status = http.StatusRequestEntityTooLarge
+		case errors.Is(err, errUpstreamResponse):
+			status = http.StatusBadGateway
+		}
+		msg := "invalid request: " + err.Error()
+		if status != http.StatusBadRequest {
+			msg = err.Error()
+		}
+		s.log(start, format, decision, cfg.Upstreams[decision.Upstream], status, false, err)
+		writeError(w, format, status, msg)
 		return
 	}
+}
+
+// writeError 以入站协议的错误信封回写错误（spec §5）：
+// OpenAI → {"error":{"message":...,"type":...}}；
+// Claude → {"type":"error","error":{"type":...,"message":...}}。
+// 认证失败用 authentication_error，其余用 invalid_request_error。
+func writeError(w http.ResponseWriter, format string, status int, message string) {
+	etype := "invalid_request_error"
+	if status == http.StatusUnauthorized {
+		etype = "authentication_error"
+	}
+	var payload []byte
+	if format == "claude" {
+		payload, _ = json.Marshal(map[string]any{
+			"type":  "error",
+			"error": convert.ClaudeError{Type: etype, Message: message},
+		})
+	} else {
+		payload, _ = json.Marshal(convert.ErrorResponse{Error: convert.ErrorDetail{Message: message, Type: etype}})
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_, _ = w.Write(payload)
 }
 
 func (s *Server) copyStream(w http.ResponseWriter, r *http.Request, src io.Reader) error {
@@ -160,6 +197,10 @@ func (s *Server) log(start time.Time, format string, d route.Decision, up config
 		"stream", stream,
 		"status", status,
 		"duration_ms", time.Since(start).Milliseconds(),
+	}
+	if d.HasImage && !d.VisionSwitch {
+		// spec §7：检测到图片但未切换（开关关/无 vision 上游）时记录
+		attrs = append(attrs, "image_detected", true)
 	}
 	if err != nil {
 		attrs = append(attrs, "error", err.Error())

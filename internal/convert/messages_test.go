@@ -1,6 +1,7 @@
 package convert
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -184,6 +185,113 @@ func TestImageConversions(t *testing.T) {
 	url := ClaudeSourceToImageURL(&ImageSource{Type: "base64", MediaType: "image/jpeg", Data: "BBBB"})
 	if url != "data:image/jpeg;base64,BBBB" {
 		t.Fatalf("url: %q", url)
+	}
+}
+
+// Critical 2: Claude image block → OpenAI image_url part（base64 source 构建 data URL），
+// 含图消息 content 输出为 []ContentPart 数组。
+func TestClaudeMessagesToOpenAI_Image(t *testing.T) {
+	msgs := []ClaudeMessage{{Role: "user", Content: []ClaudeBlock{
+		{Type: "text", Text: "what is this"},
+		{Type: "image", Source: &ImageSource{Type: "base64", MediaType: "image/png", Data: "iVBORw0KGgo="}},
+	}}}
+	out, err := ClaudeMessagesToOpenAI(msgs, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out) != 1 || out[0].Role != "user" {
+		t.Fatalf("out: %+v", out)
+	}
+	parts, ok := out[0].Content.([]ContentPart)
+	if !ok {
+		t.Fatalf("image message content must be []ContentPart, got %T", out[0].Content)
+	}
+	if len(parts) != 2 || parts[0].Type != "text" || parts[0].Text != "what is this" {
+		t.Fatalf("text part: %+v", parts)
+	}
+	if parts[1].Type != "image_url" || parts[1].ImageURL == nil ||
+		parts[1].ImageURL.URL != "data:image/png;base64,iVBORw0KGgo=" {
+		t.Fatalf("image part: %+v", parts[1])
+	}
+	// 序列化形状：OpenAI 上游要求 content 数组元素 {type,image_url:{url}}
+	raw, _ := json.Marshal(out[0])
+	if !strings.Contains(string(raw), `"image_url":{"url":"data:image/png;base64,iVBORw0KGgo="}`) {
+		t.Fatalf("marshaled shape: %s", raw)
+	}
+}
+
+// Critical 2: 纯图消息（无文本）也输出数组 content；nil/缺字段 source 防御性跳过。
+func TestClaudeMessagesToOpenAI_ImageDefensive(t *testing.T) {
+	cases := []struct {
+		name string
+		msgs []ClaudeMessage
+		want int // 期望的输出消息数
+	}{
+		{
+			"image only",
+			[]ClaudeMessage{{Role: "user", Content: []ClaudeBlock{
+				{Type: "image", Source: &ImageSource{Type: "base64", MediaType: "image/png", Data: "AAAA"}},
+			}}},
+			1,
+		},
+		{
+			"nil source skipped",
+			[]ClaudeMessage{{Role: "user", Content: []ClaudeBlock{{Type: "image"}}}},
+			0,
+		},
+		{
+			"missing media_type skipped",
+			[]ClaudeMessage{{Role: "user", Content: []ClaudeBlock{
+				{Type: "image", Source: &ImageSource{Type: "base64", Data: "AAAA"}},
+			}}},
+			0,
+		},
+		{
+			"url type skipped (C2O 不下载)",
+			[]ClaudeMessage{{Role: "user", Content: []ClaudeBlock{
+				{Type: "image", Source: &ImageSource{Type: "url", MediaType: "image/png", Data: "https://x.com/a.png"}},
+			}}},
+			0,
+		},
+		{
+			"json shape image",
+			[]ClaudeMessage{{Role: "user", Content: []any{
+				map[string]any{"type": "image", "source": map[string]any{"type": "base64", "media_type": "image/jpeg", "data": "BBBB"}},
+			}}},
+			1,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := ClaudeMessagesToOpenAI(tc.msgs, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(out) != tc.want {
+				t.Fatalf("messages: %d, want %d (%+v)", len(out), tc.want, out)
+			}
+			if len(out) > 0 {
+				parts, ok := out[0].Content.([]ContentPart)
+				if !ok {
+					t.Fatalf("content must be []ContentPart: %T", out[0].Content)
+				}
+				for _, p := range parts {
+					if p.Type == "image_url" && p.ImageURL != nil && !strings.HasPrefix(p.ImageURL.URL, "data:") {
+						t.Fatalf("image part url: %q", p.ImageURL.URL)
+					}
+				}
+			}
+		})
+	}
+}
+
+// Minor 6: data URL 缺 media type（data:;base64,...）→ 400 拒绝（spec §5）。
+func TestImageURLToClaudeSource_EmptyMediaType(t *testing.T) {
+	if _, _, err := ImageURLToClaudeSource("data:;base64,AAAA"); err == nil {
+		t.Fatal("empty media type must be rejected")
+	}
+	if _, _, err := ImageURLToClaudeSource("data:image/png;base64,AAAA"); err != nil {
+		t.Fatalf("valid data url rejected: %v", err)
 	}
 }
 

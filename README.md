@@ -93,7 +93,12 @@ curl -s http://127.0.0.1:8787/v1/chat/completions \
 ### 认证
 
 - `auth_keys: []`：认证关闭，任意 key 放行。
-- 配置了 key：OpenAI 入口校验 `Authorization: Bearer <key>`，Claude 入口校验 `x-api-key: <key>`；不匹配返回 401 `{"error":{"message":"invalid api key","type":"authentication_error"}}`。
+- 配置了 key：OpenAI 入口校验 `Authorization: Bearer <key>`，Claude 入口校验 `x-api-key: <key>`；不匹配返回 401，错误体为入站协议信封（OpenAI 格式 `{"error":{"message":"invalid api key","type":"authentication_error"}}`，Claude 格式 `{"type":"error","error":{...}}`）。
+
+## 安全注意事项
+
+- **外链图片下载（SSRF 风险）**：O2C 方向（OpenAI 客户端 → Claude 上游）会为请求中的外链图片（`image_url` 为 `http://`/`https://`）发起代理下载，再内联为 base64。下载仅允许 http/https 协议、跟随最多 3 次重定向、响应体上限 50MB、超时 30s。**风险**：代理可能访问任意主机，包括内网/云元数据地址（如 `http://169.254.169.254/`、`http://127.0.0.1/` 上的内部服务），图片 URL 由调用方控制。请仅在可信本机环境运行本代理，不要向不可信调用方开放；在共享/多租户网络部署时需自行补充白名单或网络隔离。
+- 认证密钥经环境/配置文件管理，勿提交到版本库。
 
 ## 热加载
 
@@ -116,6 +121,7 @@ msg="config reloaded" path=prism-proxy.yaml
 | `outbound` | 上游协议 `openai` / `claude` |
 | `model` | 改写后的模型名 |
 | `vision_switch` | 是否触发图片切换（bool） |
+| `image_detected` | 检测到图片但未切换（开关关/无 vision 上游）时为 `true` |
 | `stream` | 是否流式（bool） |
 | `status` | 回写客户端的 HTTP 状态码 |
 | `duration_ms` | 请求耗时（毫秒） |

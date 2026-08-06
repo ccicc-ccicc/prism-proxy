@@ -62,3 +62,32 @@ func TestClaudeResponseToOpenAI_ThinkingStripped(t *testing.T) {
 }
 
 func strPtr(s string) *string { return &s }
+
+// Minor 8: 空 choices 不 panic（Choices[0] 越界防护）。
+func TestOpenAIResponseToClaude_EmptyChoices(t *testing.T) {
+	out, err := OpenAIResponseToClaude(&ChatCompletionResponse{}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Content) != 0 || out.StopReason != nil {
+		t.Fatalf("empty choices must yield empty content and nil stop_reason: %+v", out)
+	}
+}
+
+// Minor 8: image block 的 Source 为 nil/不完整 → 跳过，不 panic、不产生非法 data URL。
+func TestClaudeResponseToOpenAI_NilImageSource(t *testing.T) {
+	resp := &MessagesResponse{
+		Content: []ClaudeBlock{
+			{Type: "image"},
+			{Type: "image", Source: &ImageSource{Type: "base64", MediaType: "image/png"}}, // 缺 data
+			{Type: "text", Text: "answer"},
+		},
+	}
+	out, err := ClaudeResponseToOpenAI(resp, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Choices[0].Message.Content != "answer" {
+		t.Fatalf("content: %v", out.Choices[0].Message.Content)
+	}
+}

@@ -87,6 +87,25 @@ func TestC2OStream_PingAndStatsSwallowed(t *testing.T) {
 	}
 }
 
+// Critical 1: 上游 error 事件 → Write 返回 error（绝不静默吞掉并伪造成功），
+// 错误信息取自 payload 的 error.message。
+func TestC2OStream_ErrorEvent(t *testing.T) {
+	s := NewC2OStream("claude-3")
+	out, err := s.Write([]byte("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-3\",\"content\":[]}}\n\n"))
+	if err != nil || len(out) != 1 {
+		t.Fatalf("start: %v %s", err, out)
+	}
+	_, err = s.Write([]byte("event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n"))
+	if err == nil || !strings.Contains(err.Error(), "Overloaded") {
+		t.Fatalf("error event must fail the stream, got %v", err)
+	}
+	// 无 message 的 error 事件 → 同样报错（通用消息）
+	_, err = s.Write([]byte("event: error\ndata: {\"type\":\"error\"}\n\n"))
+	if err == nil {
+		t.Fatal("bare error event must fail the stream")
+	}
+}
+
 func TestParseClaudeFrame(t *testing.T) {
 	event, data, err := ParseClaudeFrame([]byte("event: content_block_delta\ndata: {\"x\":1}\n\n"))
 	if err != nil || event != EventContentBlockDelta || string(data) != `{"x":1}` {

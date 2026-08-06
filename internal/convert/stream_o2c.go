@@ -46,12 +46,15 @@ func (s *O2CStream) Write(data []byte) ([][]byte, error) {
 	if !s.started {
 		s.started = true
 		frames = append(frames, s.frame(EventMessageStart, StreamEvent{
-			Message: &MessagesResponse{ID: s.id, Type: "message", Role: "assistant", Model: s.model, Content: []ClaudeBlock{}},
+			// 真实 Anthropic message_start 的 message 携带 stop_reason/stop_sequence
+			// （null）与 usage（零值），SDK 按此形状解析。
+			Message: &MessagesResponse{ID: s.id, Type: "message", Role: "assistant", Model: s.model, Content: []ClaudeBlock{}, Usage: &ClaudeUsage{}},
 		}))
 	}
 	if len(chunk.Choices) == 0 {
 		if chunk.Usage != nil {
-			frames = append(frames, s.frame(EventMessageDelta, StreamEvent{Usage: &ClaudeUsage{InputTokens: chunk.Usage.PromptTokens, OutputTokens: chunk.Usage.CompletionTokens}}))
+			// message_delta 恒带 delta 对象（usage-only 时为 {}），usage 随帧携带
+			frames = append(frames, s.frame(EventMessageDelta, StreamEvent{Delta: &ClaudeDelta{}, Usage: &ClaudeUsage{InputTokens: chunk.Usage.PromptTokens, OutputTokens: chunk.Usage.CompletionTokens}}))
 		}
 		return frames, nil
 	}
@@ -93,10 +96,15 @@ func (s *O2CStream) Write(data []byte) ([][]byte, error) {
 			frames = append(frames, s.frame(EventContentBlockStop, StreamEvent{Index: s.blockIdx}))
 			s.inText, s.inTool = false, false
 		}
-		frames = append(frames, s.frame(EventMessageDelta, StreamEvent{StopReason: stopReasonO2C(*fr)}))
-	}
-	if chunk.Usage != nil {
-		frames = append(frames, s.frame(EventMessageDelta, StreamEvent{Usage: &ClaudeUsage{InputTokens: chunk.Usage.PromptTokens, OutputTokens: chunk.Usage.CompletionTokens}}))
+		// Anthropic 真实 message_delta：stop_reason 嵌套在 delta 内
+		// （{"delta":{"stop_reason":"end_turn"}}），usage 可同帧携带
+		ev := StreamEvent{Delta: &ClaudeDelta{StopReason: stopReasonO2C(*fr)}}
+		if chunk.Usage != nil {
+			ev.Usage = &ClaudeUsage{InputTokens: chunk.Usage.PromptTokens, OutputTokens: chunk.Usage.CompletionTokens}
+		}
+		frames = append(frames, s.frame(EventMessageDelta, ev))
+	} else if chunk.Usage != nil {
+		frames = append(frames, s.frame(EventMessageDelta, StreamEvent{Delta: &ClaudeDelta{}, Usage: &ClaudeUsage{InputTokens: chunk.Usage.PromptTokens, OutputTokens: chunk.Usage.CompletionTokens}}))
 	}
 	return frames, nil
 }

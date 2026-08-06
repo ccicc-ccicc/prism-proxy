@@ -119,6 +119,8 @@ func convertOpenAIContent(c any) any {
 //   - system 放 messages[0]（role=system，\n 已由调用方合并）
 //   - user/assistant 直转；tool_use block → tool_calls（input 序列化为 JSON 串）
 //   - tool_result block → 拆为 role=tool 消息（is_error 前缀错误标记；content 数组转文本）
+//   - image block → image_url part（base64 source 构建 data URL，spec §5）；
+//     含图消息的 content 输出为 []ContentPart 数组（text + image_url 顺序拼接）
 //   - emit 顺序：tool_result（role=tool）消息必须先于同一消息内的 user 文本
 func ClaudeMessagesToOpenAI(msgs []ClaudeMessage, system string) ([]ChatMessage, error) {
 	var out []ChatMessage
@@ -139,12 +141,31 @@ func ClaudeMessagesToOpenAI(msgs []ClaudeMessage, system string) ([]ChatMessage,
 				continue
 			}
 			var text strings.Builder
+			var imageParts []ContentPart
 			var toolCalls []ToolCall
 			var toolResults []ChatMessage
+			hasImage := false
 			for _, bm := range blocks {
 				switch bm["type"] {
 				case "text":
 					text.WriteString(fmt.Sprint(bm["text"]))
+				case "image":
+					// base64 source → data URL（spec §5 C2O）；source 缺失/非 base64/缺字段
+					// 防御性跳过（不 panic、不产生非法 data URL）
+					sm, ok := bm["source"].(map[string]any)
+					if !ok || sm["type"] != "base64" {
+						continue
+					}
+					mediaType, mok := sm["media_type"].(string)
+					data, dok := sm["data"].(string)
+					if !mok || !dok || mediaType == "" || data == "" {
+						continue
+					}
+					hasImage = true
+					imageParts = append(imageParts, ContentPart{
+						Type:     "image_url",
+						ImageURL: &ImageURL{URL: ClaudeSourceToImageURL(&ImageSource{Type: "base64", MediaType: mediaType, Data: data})},
+					})
 				case "tool_use":
 					toolCalls = append(toolCalls, ToolCall{
 						ID:   fmt.Sprint(bm["id"]),
@@ -162,7 +183,17 @@ func ClaudeMessagesToOpenAI(msgs []ClaudeMessage, system string) ([]ChatMessage,
 			}
 			// 工具结果必须紧跟 assistant(tool_calls)：toolResults 先入，text 与 tool_calls 排在其后
 			out = append(out, toolResults...)
-			if text.Len() > 0 {
+			if hasImage {
+				// 含图消息：content 必须是 part 数组（text + image_url）
+				content := make([]ContentPart, 0, len(imageParts)+1)
+				if text.Len() > 0 {
+					content = append(content, ContentPart{Type: "text", Text: text.String()})
+				}
+				content = append(content, imageParts...)
+				if len(content) > 0 {
+					out = append(out, ChatMessage{Role: m.Role, Content: content})
+				}
+			} else if text.Len() > 0 {
 				out = append(out, ChatMessage{Role: m.Role, Content: text.String()})
 			}
 			if len(toolCalls) > 0 {
@@ -298,6 +329,10 @@ func ImageURLToClaudeSource(url string) (*ImageSource, string, error) {
 	}
 	// media type 取第一个 ";" 前的段：data:image/png;charset=utf-8;base64,... → "image/png"
 	mediaType, _, _ := strings.Cut(url[len("data:"):comma], ";")
+	if mediaType == "" {
+		// spec §5：media_type 与 data 都缺 → 拒绝（400）
+		return nil, "", fmt.Errorf("data url missing media type")
+	}
 	return &ImageSource{Type: "base64", MediaType: mediaType, Data: url[comma+len(";base64,"):]}, "", nil
 }
 

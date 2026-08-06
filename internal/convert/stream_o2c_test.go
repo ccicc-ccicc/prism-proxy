@@ -205,6 +205,85 @@ func TestO2CStream_ToolStartWithArguments(t *testing.T) {
 	}
 }
 
+// Important 3: message_start 的 message 必须携带 stop_reason:null、stop_sequence:null 与 usage。
+func TestO2CStream_MessageStartSchema(t *testing.T) {
+	s := NewO2CStreamWithModel("gpt-4o")
+	out, err := s.Write([]byte(`{"id":"chatcmpl-1","object":"chat.completion.chunk","model":"gpt-4o","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}`))
+	if err != nil || len(out) != 1 {
+		t.Fatalf("start: %d %v", len(out), err)
+	}
+	ev := decodeEvent(t, out[0])
+	if ev.Message == nil {
+		t.Fatalf("message_start must carry message: %s", out[0])
+	}
+	if ev.Message.StopReason != nil || ev.Message.StopSequence != nil {
+		t.Fatalf("stop_reason/stop_sequence must be null: %+v", ev.Message)
+	}
+	if ev.Message.Usage == nil {
+		t.Fatalf("message_start message must carry usage: %+v", ev.Message)
+	}
+	if !strings.Contains(string(out[0]), `"stop_reason":null`) || !strings.Contains(string(out[0]), `"stop_sequence":null`) {
+		t.Fatalf("raw message_start must contain explicit nulls: %s", out[0])
+	}
+}
+
+// Important 3: message_delta 的 stop_reason 必须嵌套在 delta 内
+// （{"delta":{"stop_reason":"end_turn"}}），顶层不得出现 stop_reason。
+func TestO2CStream_MessageDeltaNested(t *testing.T) {
+	s := NewO2CStreamWithModel("gpt-4o")
+	_, _ = s.Write([]byte(`{"choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}`))
+	_, _ = s.Write([]byte(`{"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}`))
+	out, _ := s.Write([]byte(`{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`))
+	if len(out) != 2 {
+		t.Fatalf("finish frames: %d (%s)", len(out), out)
+	}
+	ev := decodeEvent(t, out[1])
+	if ev.Delta == nil || ev.Delta.StopReason == nil || *ev.Delta.StopReason != "end_turn" {
+		t.Fatalf("stop_reason must be nested in delta: %+v", ev)
+	}
+	if ev.StopReason != nil {
+		t.Fatalf("top-level stop_reason must not exist: %+v", ev)
+	}
+	if !strings.Contains(string(out[1]), `"delta":{"stop_reason":"end_turn"}`) {
+		t.Fatalf("raw message_delta shape: %s", out[1])
+	}
+}
+
+// Important 3: usage-only message_delta 恒带 delta 对象（{}），usage 随帧携带。
+func TestO2CStream_MessageDeltaUsageOnly(t *testing.T) {
+	s := NewO2CStream()
+	_, _ = s.Write([]byte(`{"choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}`))
+	out, _ := s.Write([]byte(`{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`))
+	if len(out) != 1 || !strings.Contains(string(out[0]), "message_delta") {
+		t.Fatalf("usage frame: %s", out[0])
+	}
+	ev := decodeEvent(t, out[0])
+	if ev.Delta == nil {
+		t.Fatalf("usage-only message_delta must still carry delta: %+v", ev)
+	}
+	if ev.Usage == nil || ev.Usage.InputTokens != 10 || ev.Usage.OutputTokens != 5 {
+		t.Fatalf("usage payload: %+v", ev.Usage)
+	}
+}
+
+// Important 3: finish chunk 自带 usage → 单个 message_delta 同时携带 delta 与 usage。
+func TestO2CStream_FinishUsageMerged(t *testing.T) {
+	s := NewO2CStream()
+	_, _ = s.Write([]byte(`{"choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}`))
+	_, _ = s.Write([]byte(`{"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}`))
+	out, _ := s.Write([]byte(`{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`))
+	if len(out) != 2 {
+		t.Fatalf("finish frames: %d (%s)", len(out), out)
+	}
+	ev := decodeEvent(t, out[1])
+	if ev.Delta == nil || ev.Delta.StopReason == nil || *ev.Delta.StopReason != "end_turn" {
+		t.Fatalf("delta: %+v", ev)
+	}
+	if ev.Usage == nil || ev.Usage.InputTokens != 10 || ev.Usage.OutputTokens != 5 {
+		t.Fatalf("usage must ride along the finish delta: %+v", ev.Usage)
+	}
+}
+
 // Minor 5: usage chunk → message_delta{usage}，prompt/completion tokens 正确映射。
 func TestO2CStream_UsageDelta(t *testing.T) {
 	s := NewO2CStream()

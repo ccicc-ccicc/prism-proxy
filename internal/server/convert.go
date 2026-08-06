@@ -17,6 +17,13 @@ import (
 	"prism-proxy/internal/route"
 )
 
+// 上游来源的错误（区别于请求侧转换错误，后者保持 400）：
+// errUpstreamResponse → 502（读取/解析上游响应失败）；errResponseTooLarge → 413。
+var (
+	errUpstreamResponse = errors.New("upstream response error")
+	errResponseTooLarge = errors.New("upstream response too large")
+)
+
 // relay 处理单个请求的完整转发。format 为入站格式，up.Format 为出站格式：
 // 同格式透传，交叉格式先转换请求再转发，响应按流式/非流式反向转换。
 func (s *Server) relay(w http.ResponseWriter, r *http.Request, cfg *config.Config, format string, body []byte, d route.Decision) error {
@@ -76,7 +83,7 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, up *config.Upst
 	resp, err := s.client.Do(r.Context(), up, outbound, false)
 	if err != nil {
 		s.log(start, inboundFormat, d, *up, http.StatusBadGateway, false, err)
-		http.Error(w, "upstream error: "+err.Error(), http.StatusBadGateway)
+		writeError(w, inboundFormat, http.StatusBadGateway, "upstream error: "+err.Error())
 		return nil
 	}
 	defer resp.Body.Close()
@@ -125,16 +132,18 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, up *config.Upst
 	}
 	data, err := io.ReadAll(io.LimitReader(resp.Body, maxBody+1))
 	if err != nil {
-		return fmt.Errorf("read upstream response: %w", err)
+		// 上游响应读取失败：上游来源错误 → 502
+		return fmt.Errorf("%w: read upstream response: %v", errUpstreamResponse, err)
 	}
 	if len(data) > maxBody {
-		return fmt.Errorf("upstream response too large")
+		// 上游响应超限 → 413
+		return fmt.Errorf("%w: exceeds %d bytes", errResponseTooLarge, maxBody)
 	}
 	var out any
 	if inboundFormat == "openai" { // 上游 Claude → 客户端 OpenAI
 		var cr convert.MessagesResponse
 		if err := json.Unmarshal(data, &cr); err != nil {
-			return fmt.Errorf("parse claude response: %w", err)
+			return fmt.Errorf("%w: parse claude response: %v", errUpstreamResponse, err)
 		}
 		o, err := convert.ClaudeResponseToOpenAI(&cr, "")
 		if err != nil {
@@ -145,7 +154,7 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, up *config.Upst
 	} else { // 上游 OpenAI → 客户端 Claude
 		var or convert.ChatCompletionResponse
 		if err := json.Unmarshal(data, &or); err != nil {
-			return fmt.Errorf("parse openai response: %w", err)
+			return fmt.Errorf("%w: parse openai response: %v", errUpstreamResponse, err)
 		}
 		o, err := convert.OpenAIResponseToClaude(&or, "")
 		if err != nil {
@@ -341,12 +350,21 @@ func fetchExternalImages(req *convert.MessagesRequest) error {
 	return nil
 }
 
-// downloadImage 下载外链图片（仅 http/https），返回 base64 ImageSource。
+// downloadImage 下载外链图片（仅 http/https，跟随最多 3 次重定向），
+// 返回 base64 ImageSource。SSRF 风险见 README「安全注意事项」。
 func downloadImage(url string) (*convert.ImageSource, error) {
 	if !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
 		return nil, fmt.Errorf("unsupported image url scheme")
 	}
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 3 {
+				return fmt.Errorf("too many redirects")
+			}
+			return nil
+		},
+	}
 	resp, err := client.Get(url)
 	if err != nil {
 		return nil, fmt.Errorf("download image: %w", err)

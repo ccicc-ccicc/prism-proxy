@@ -23,8 +23,10 @@ func OpenAIResponseToClaude(resp *ChatCompletionResponse, id string) (*MessagesR
 		}
 	}
 	out.Content = blocks
-	if fr := resp.Choices[0].FinishReason; fr != "" {
-		out.StopReason = stopReasonO2C(fr)
+	if len(resp.Choices) > 0 {
+		if fr := resp.Choices[0].FinishReason; fr != "" {
+			out.StopReason = stopReasonO2C(fr)
+		}
 	}
 	if resp.Usage != nil {
 		out.Usage = &ClaudeUsage{InputTokens: resp.Usage.PromptTokens, OutputTokens: resp.Usage.CompletionTokens}
@@ -55,6 +57,9 @@ func ClaudeResponseToOpenAI(resp *MessagesResponse, id string) (*ChatCompletionR
 			}
 			toolCalls = append(toolCalls, ToolCall{ID: b.ID, Type: "function", Function: ToolCallFunction{Name: b.Name, Arguments: args}})
 		case "image":
+			if b.Source == nil || b.Source.MediaType == "" || b.Source.Data == "" {
+				continue // 防御：source 缺失/不完整 → 跳过，不 panic、不产生非法 data URL
+			}
 			text.WriteString(ClaudeSourceToImageURL(b.Source))
 		case "thinking", "redacted_thinking", "signature":
 			// 剥离
