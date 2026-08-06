@@ -38,6 +38,7 @@ type ClaudeBlock struct {
 	Name        string       `json:"name,omitempty"`
 	Input       any          `json:"input,omitempty"`
 	Content     any          `json:"content,omitempty"`
+	ToolUseID   string       `json:"tool_use_id,omitempty"`
 	IsError     *bool        `json:"is_error,omitempty"`
 	Source      *ImageSource `json:"source,omitempty"`
 	Thinking    string       `json:"thinking,omitempty"`
