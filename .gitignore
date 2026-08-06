@@ -1,0 +1,12 @@
+# 根目录构建产物（go build -o prism-proxy）
+/prism-proxy
+
+# 日志
+*.log
+
+# 本地配置文件（含密钥，绝不提交）
+prism-proxy.yaml
+
+# 编辑器 / 系统
+.DS_Store
+*.swp
