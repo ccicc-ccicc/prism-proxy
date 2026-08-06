@@ -6,6 +6,7 @@ import (
 	"os"
 
 	"github.com/spf13/cobra"
+	"prism-proxy/internal/config"
 )
 
 func main() {
@@ -36,12 +37,15 @@ func serveCmd() *cobra.Command {
 		Use:   "serve",
 		Short: "Start the proxy server",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := config.Load(configPath)
+			if err != nil {
+				return fmt.Errorf("invalid config (fail fast): %w", err)
+			}
 			mux := http.NewServeMux()
 			mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-				http.Error(w, "config not loaded yet", http.StatusNotImplemented)
+				http.Error(w, "handler wiring in later tasks", http.StatusNotImplemented)
 			})
-			addr := ":8787"
-			return http.ListenAndServe(addr, mux)
+			return http.ListenAndServe(cfg.Server.Listen, mux)
 		},
 	}
 	cmd.Flags().StringVar(&configPath, "config", "prism-proxy.yaml", "path to config file")
