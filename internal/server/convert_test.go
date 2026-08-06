@@ -1,20 +1,46 @@
 package server
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
-
-	"log/slog"
+	"time"
 
 	"prism-proxy/internal/config"
 	"prism-proxy/internal/convert"
 	"prism-proxy/internal/upstream"
 )
+
+// captureHandler 记录 slog 输出，供断言 proxy_request 日志行。
+type captureHandler struct {
+	mu    sync.Mutex
+	lines []string
+}
+
+func (h *captureHandler) Enabled(context.Context, slog.Level) bool { return true }
+func (h *captureHandler) Handle(_ context.Context, r slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	var sb strings.Builder
+	sb.WriteString(r.Message)
+	r.Attrs(func(a slog.Attr) bool {
+		sb.WriteString(" " + a.Key + "=" + fmt.Sprint(a.Value.Any()))
+		return true
+	})
+	h.lines = append(h.lines, sb.String())
+	return nil
+}
+func (h *captureHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *captureHandler) WithGroup(string) slog.Handler      { return h }
 
 func TestO2CFullChain_NonStream(t *testing.T) {
 	upstreamSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -238,5 +264,131 @@ func TestFetchExternalImages_MapShape(t *testing.T) {
 	src := parts[0].(map[string]any)["source"].(map[string]any)
 	if src["type"] != "base64" || src["media_type"] != "image/jpeg" || src["data"] != base64.StdEncoding.EncodeToString([]byte("jpeg-bytes")) {
 		t.Fatalf("source: %v", src)
+	}
+}
+
+// 上游中途发非法 chunk（O2C 转换失败）→ 不得伪造 message_stop 结束帧。
+func TestO2CStream_MidStreamError_NoMessageStop(t *testing.T) {
+	upstreamSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		fl, _ := w.(http.Flusher)
+		w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"))
+		fl.Flush()
+		w.Write([]byte("data: not-json\n\n")) // 非法 chunk → 转换失败
+		fl.Flush()
+	}))
+	defer upstreamSrv.Close()
+	cfg := &config.Config{
+		Upstreams: map[string]config.UpstreamConfig{
+			"main": {BaseURL: upstreamSrv.URL + "/v1", APIKey: "sk", Format: "openai", Model: "gpt-4o"},
+		},
+	}
+	srv := NewWithConfig(cfg, upstream.NewClient(), slog.Default())
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+	resp, err := http.Post(ts.URL+"/v1/messages", "application/json",
+		strings.NewReader(`{"model":"x","max_tokens":1024,"messages":[{"role":"user","content":"hi"}],"stream":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("status: %d", resp.StatusCode)
+	}
+	b, _ := io.ReadAll(resp.Body)
+	s := string(b)
+	// 错误前已转换的内容必须回写
+	if !strings.Contains(s, "content_block_delta") {
+		t.Fatalf("missing converted frames: %s", s)
+	}
+	// 中途错误 → 不得伪造 message_stop
+	if strings.Contains(s, "message_stop") {
+		t.Fatalf("fabricated message_stop on mid-stream error: %s", s)
+	}
+}
+
+// 交叉格式流式成功也必须产生 proxy_request 日志行。
+func TestO2CStream_SuccessLogged(t *testing.T) {
+	frames := []string{
+		"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-3\",\"content\":[]}}\n\n",
+		"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
+		"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+	}
+	upstreamSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		fl, _ := w.(http.Flusher)
+		for _, f := range frames {
+			w.Write([]byte(f))
+			fl.Flush()
+		}
+	}))
+	defer upstreamSrv.Close()
+	cfg := &config.Config{
+		Upstreams: map[string]config.UpstreamConfig{
+			"main": {BaseURL: upstreamSrv.URL + "/v1", APIKey: "sk", Format: "claude", Model: "claude-3"},
+		},
+	}
+	cap := &captureHandler{}
+	srv := NewWithConfig(cfg, upstream.NewClient(), slog.New(cap))
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+	resp, err := http.Post(ts.URL+"/v1/chat/completions", "application/json",
+		strings.NewReader(`{"model":"x","messages":[{"role":"user","content":"hi"}],"stream":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("status: %d", resp.StatusCode)
+	}
+	cap.mu.Lock()
+	defer cap.mu.Unlock()
+	for _, l := range cap.lines {
+		if strings.Contains(l, "proxy_request") && strings.Contains(l, "status=200") && strings.Contains(l, "stream=true") {
+			return
+		}
+	}
+	t.Fatalf("no success log line for cross-format stream: %v", cap.lines)
+}
+
+// 挂起的读必须被空闲超时打断（timeoutReader 复用 readWithCtx 模式）。
+func TestTimeoutReader_StalledUpstream(t *testing.T) {
+	pr, pw := io.Pipe()
+	defer pw.Close() // 解除读协程阻塞
+	rd := newTimeoutReader(context.Background(), pr, 30*time.Millisecond)
+	buf := make([]byte, 16)
+	_, err := rd.Read(buf)
+	if err == nil || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("want deadline exceeded, got %v", err)
+	}
+}
+
+// 交叉格式非流式上游响应超限 → 干净 400（而非解析失败）。
+func TestO2CResponseTooLarge(t *testing.T) {
+	big := strings.Repeat("x", maxBody+1)
+	upstreamSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(big))
+	}))
+	defer upstreamSrv.Close()
+	cfg := &config.Config{
+		Upstreams: map[string]config.UpstreamConfig{
+			"main": {BaseURL: upstreamSrv.URL + "/v1", APIKey: "sk", Format: "claude", Model: "claude-3"},
+		},
+	}
+	srv := NewWithConfig(cfg, upstream.NewClient(), slog.Default())
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+	resp, err := http.Post(ts.URL+"/v1/chat/completions", "application/json",
+		strings.NewReader(`{"model":"x","messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 400 {
+		t.Fatalf("status: %d, want 400", resp.StatusCode)
 	}
 }

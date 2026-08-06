@@ -2,6 +2,7 @@ package server
 
 import (
 	"bufio"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -116,16 +117,18 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, up *config.Upst
 	if isStream {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(resp.StatusCode)
-		if cerr := s.convertStream(w, resp.Body, inboundFormat, up.Format, up.Model); cerr != nil {
-			// 上游中途断流/转换失败：停止转发（已完成回写的部分保留），
-			// 不伪造结束事件，仅记日志
-			s.log(start, inboundFormat, d, *up, resp.StatusCode, true, cerr)
-		}
+		cerr := s.convertStream(r.Context(), w, resp.Body, inboundFormat, up.Format, up.Model)
+		// 成功与中途断流/转换失败都记日志：成功一行（status 200），
+		// 失败停止转发（已完成回写的部分保留），不伪造结束事件
+		s.log(start, inboundFormat, d, *up, resp.StatusCode, true, cerr)
 		return nil
 	}
 	data, err := io.ReadAll(io.LimitReader(resp.Body, maxBody+1))
 	if err != nil {
 		return fmt.Errorf("read upstream response: %w", err)
+	}
+	if len(data) > maxBody {
+		return fmt.Errorf("upstream response too large")
 	}
 	var out any
 	if inboundFormat == "openai" { // 上游 Claude → 客户端 OpenAI
@@ -162,10 +165,13 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, up *config.Upst
 
 // convertStream 将上游 SSE 流逐帧转换为对端格式并回写：
 //   - outboundFormat == "claude"（上游 Claude，客户端 OpenAI）：C2OStream 逐帧转换，
-//     流结束（done）时回写 Close() 的 [DONE]；
+//     流结束（done）时回写 Close() 的 [DONE]；中途错误返回 error（不写 [DONE]）；
 //   - outboundFormat == "openai"（上游 OpenAI，客户端 Claude）：O2CStream 按 data 行转换，
-//     [DONE] 或断流后统一回写 Finish() 的结束帧。
-func (s *Server) convertStream(w http.ResponseWriter, src io.Reader, inboundFormat, outboundFormat, model string) error {
+//     正常结束（[DONE] 或 EOF）回写 Finish() 的结束帧；中途错误返回 error，不发任何结束帧。
+//
+// 流式读受 streamIdleTimeout 空闲超时约束：上游挂起时读返回超时错误，停止转发。
+func (s *Server) convertStream(ctx context.Context, w http.ResponseWriter, src io.Reader, inboundFormat, outboundFormat, model string) error {
+	src = newTimeoutReader(ctx, src, streamIdleTimeout)
 	if outboundFormat == "claude" {
 		// OpenAI 客户端收 Claude 流 → C2O
 		c := convert.NewC2OStream(model)
@@ -196,16 +202,21 @@ func (s *Server) convertStream(w http.ResponseWriter, src io.Reader, inboundForm
 	// 客户端 Claude 收 OpenAI 流 → O2C
 	c := convert.NewO2CStreamWithModel(model)
 	scanner := &openAISSE{}
+	var streamErr error
 	for {
 		data, done, err := scanner.Next(src)
 		if done {
 			break
 		}
 		if err != nil {
-			break // 断流
+			if !errors.Is(err, io.EOF) {
+				streamErr = err // 断流/读超时：不伪造结束帧
+			}
+			break
 		}
 		outs, err := c.Write(data)
 		if err != nil {
+			streamErr = err // chunk 解析失败：不伪造结束帧
 			break
 		}
 		fl, _ := w.(http.Flusher)
@@ -216,14 +227,17 @@ func (s *Server) convertStream(w http.ResponseWriter, src io.Reader, inboundForm
 			fl.Flush()
 		}
 	}
-	for _, o := range c.Finish() {
-		_, _ = w.Write(o)
+	// 仅正常结束才发 message_stop；中途错误静默断流（由调用方记日志）
+	if streamErr == nil {
+		for _, o := range c.Finish() {
+			_, _ = w.Write(o)
+		}
+		fl, _ := w.(http.Flusher)
+		if fl != nil {
+			fl.Flush()
+		}
 	}
-	fl, _ := w.(http.Flusher)
-	if fl != nil {
-		fl.Flush()
-	}
-	return nil
+	return streamErr
 }
 
 // readClaudeFrames 逐帧读取 Claude SSE 流并回调；流正常结束调用 onDone，
@@ -245,6 +259,26 @@ func (s *Server) readClaudeFrames(src io.Reader, onFrame func([]byte) error, onD
 			return err
 		}
 	}
+}
+
+// timeoutReader 给流式读加空闲超时：每次 Read 不超过 timeout 即返回
+// 超时错误（复用 readWithCtx 的逐块超时模式），防止上游挂起时
+// handler 被 bufio.Scanner 永久阻塞。与 copyStream 相同的超时语义。
+type timeoutReader struct {
+	ctx     context.Context
+	timeout time.Duration
+	src     io.Reader
+}
+
+func newTimeoutReader(ctx context.Context, src io.Reader, timeout time.Duration) io.Reader {
+	return &timeoutReader{ctx: ctx, timeout: timeout, src: src}
+}
+
+func (r *timeoutReader) Read(p []byte) (int, error) {
+	ctx, cancel := context.WithTimeout(r.ctx, r.timeout)
+	defer cancel()
+	b, err := readWithCtx(ctx, r.src, p)
+	return len(b), err
 }
 
 // requestStream 从请求 body 提取 stream 字段。
