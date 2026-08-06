@@ -32,7 +32,7 @@ func OpenAIMessagesToClaude(msgs []ChatMessage) (system string, out []ClaudeMess
 			for _, tc := range m.ToolCalls {
 				input, perr := OpenAIArgsToClaudeInput(tc.Function.Arguments)
 				if perr != nil {
-					slog.Warn("tool_call arguments not valid json, using {}", "tool", tc.Function.Name)
+					slog.Warn("tool_call arguments not valid json, using default empty input", "tool", tc.Function.Name)
 				}
 				blocks = append(blocks, ClaudeBlock{Type: "tool_use", ID: tc.ID, Name: tc.Function.Name, Input: input})
 			}
@@ -296,7 +296,8 @@ func ImageURLToClaudeSource(url string) (*ImageSource, string, error) {
 	if comma < 0 {
 		return nil, "", fmt.Errorf("unsupported data url format")
 	}
-	mediaType := strings.TrimPrefix(url[len("data:"):comma], "data:")
+	// media type 取第一个 ";" 前的段：data:image/png;charset=utf-8;base64,... → "image/png"
+	mediaType, _, _ := strings.Cut(url[len("data:"):comma], ";")
 	return &ImageSource{Type: "base64", MediaType: mediaType, Data: url[comma+len(";base64,"):]}, "", nil
 }
 
