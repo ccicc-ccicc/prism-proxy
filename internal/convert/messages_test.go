@@ -201,3 +201,49 @@ func TestBlockHasImage_NestedInToolResult(t *testing.T) {
 		t.Fatal("image nested in tool_result not detected")
 	}
 }
+
+// TestContentHasImage: []ClaudeBlock 委托 BlockHasImage；[]any 兼容
+// image_url / image / tool_result 递归，非 map 元素跳过。
+func TestContentHasImage(t *testing.T) {
+	cases := []struct {
+		name  string
+		parts any
+		want  bool
+	}{
+		{"claude blocks no image", []ClaudeBlock{{Type: "text", Text: "x"}}, false},
+		{"claude blocks image", []ClaudeBlock{{Type: "image", Source: &ImageSource{Type: "base64", Data: "x"}}}, true},
+		{"any text", []any{map[string]any{"type": "text", "text": "x"}}, false},
+		{"any image_url", []any{map[string]any{"type": "image_url"}}, true},
+		{"any claude image", []any{map[string]any{"type": "image"}}, true},
+		{"any non-map skipped", []any{"string", 42}, false},
+		{"any tool_result recursion", []any{map[string]any{"type": "tool_result", "content": []any{map[string]any{"type": "image"}}}}, true},
+		{"any tool_result no image", []any{map[string]any{"type": "tool_result", "content": []any{map[string]any{"type": "text"}}}}, false},
+		{"any tool_result wrong shape", []any{map[string]any{"type": "tool_result", "content": "string"}}, false},
+	}
+	for _, tc := range cases {
+		if got := ContentHasImage(tc.parts); got != tc.want {
+			t.Errorf("%s: got %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestArgsConversionFallbacks: arguments 兜底分支。
+//   - OpenAIArgsToClaudeInput: 空串/非法 JSON → 空对象；非法 JSON 带 error
+//   - ClaudeInputToOpenAIArgs: 不可序列化 input（chan）→ "{}" + error
+func TestArgsConversionFallbacks(t *testing.T) {
+	if v, err := OpenAIArgsToClaudeInput(""); err != nil || len(v.(map[string]any)) != 0 {
+		t.Fatalf("empty args: v=%v err=%v", v, err)
+	}
+	if v, err := OpenAIArgsToClaudeInput(`{"x":1}`); err != nil || v.(map[string]any)["x"] != float64(1) {
+		t.Fatalf("valid args: v=%v err=%v", v, err)
+	}
+	if v, err := OpenAIArgsToClaudeInput("{not json"); err == nil || len(v.(map[string]any)) != 0 {
+		t.Fatalf("invalid args: v=%v err=%v", v, err)
+	}
+	if s, err := ClaudeInputToOpenAIArgs(map[string]any{"ok": true}); err != nil || s != `{"ok":true}` {
+		t.Fatalf("valid input: s=%q err=%v", s, err)
+	}
+	if s, err := ClaudeInputToOpenAIArgs(map[string]any{"bad": make(chan int)}); err == nil || s != "{}" {
+		t.Fatalf("unmarshallable input: s=%q err=%v", s, err)
+	}
+}

@@ -70,6 +70,25 @@ func TestDecide_Disabled(t *testing.T) {
 	}
 }
 
+// TestDecide_VisionMissing: auto_switch_vision 开启但无 vision 上游（配置直接构造，
+// 绕过 Validate 的 fail-fast）时，带图请求应回落 main，不 panic。
+func TestDecide_VisionMissing(t *testing.T) {
+	cfg := &config.Config{
+		AutoSwitchVision: true,
+		Upstreams: map[string]config.UpstreamConfig{
+			"main": {BaseURL: "https://a/v1", APIKey: "k", Format: "openai", Model: "gpt-4o"},
+		},
+	}
+	body := []byte(`{"model":"x","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}]}]}`)
+	d, err := Decide(cfg, "openai", body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.Upstream != "main" || d.VisionSwitch || d.Model != "gpt-4o" {
+		t.Fatalf("decision: %+v", d)
+	}
+}
+
 func TestDecide_InvalidBody(t *testing.T) {
 	_, err := Decide(testConfig(), "openai", []byte("{not json"))
 	if err == nil {
