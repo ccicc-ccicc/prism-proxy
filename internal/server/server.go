@@ -3,7 +3,6 @@ package server
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -75,47 +74,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid request: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	up, ok := cfg.Upstreams[decision.Upstream]
-	if !ok {
-		http.Error(w, "upstream not found", http.StatusBadGateway)
+	if err := s.relay(w, r, cfg, format, body, decision); err != nil {
+		// 请求解析/转换失败：未写入任何响应，回 400
+		s.log(start, format, decision, cfg.Upstreams[decision.Upstream], http.StatusBadRequest, false, err)
+		http.Error(w, "invalid request: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	outbound, err := rewriteModel(format, body, decision.Model)
-	if err != nil {
-		http.Error(w, "rewrite: "+err.Error(), http.StatusBadRequest)
-		return
-	}
-	// Task 13 在此插入交叉转换
-	resp, err := s.client.Do(r.Context(), &up, outbound, false)
-	if err != nil {
-		s.log(start, format, decision, up, 0, false, err)
-		http.Error(w, "upstream error: "+err.Error(), http.StatusBadGateway)
-		return
-	}
-	defer resp.Body.Close()
-	isStream := strings.HasPrefix(resp.Header.Get("Content-Type"), "text/event-stream")
-	for k, vv := range resp.Header {
-		for _, v := range vv {
-			w.Header().Add(k, v)
-		}
-	}
-	w.WriteHeader(resp.StatusCode)
-	if resp.StatusCode >= 400 {
-		_, _ = io.Copy(w, resp.Body)
-		s.log(start, format, decision, up, resp.StatusCode, isStream, nil)
-		return
-	}
-	var copyErr error
-	if isStream {
-		copyErr = s.copyStream(w, r, resp.Body)
-	} else {
-		_, copyErr = io.Copy(w, resp.Body)
-	}
-	if copyErr != nil && !errors.Is(copyErr, io.EOF) {
-		s.log(start, format, decision, up, resp.StatusCode, isStream, copyErr)
-		return
-	}
-	s.log(start, format, decision, up, resp.StatusCode, isStream, nil)
 }
 
 func (s *Server) copyStream(w http.ResponseWriter, r *http.Request, src io.Reader) error {
