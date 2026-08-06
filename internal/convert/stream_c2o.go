@@ -22,7 +22,7 @@ import (
 type C2OStream struct {
 	id        string
 	model     string
-	toolIdx   int // 只对 tool_use 独立计数
+	toolIdx   int // 下一个 tool_use 块的索引（只对 tool_use 独立计数）
 	inTool    bool
 	lastChunk []byte
 }
@@ -74,11 +74,11 @@ func (s *C2OStream) Write(frame []byte) ([][]byte, error) {
 		case "thinking", "redacted_thinking":
 			return nil, nil // 剥离
 		case "tool_use":
-			if s.inTool { // 防御：上一 tool 块未 stop 前新开，仍独立递增
-				s.toolIdx++
-			}
-			s.inTool = true
+			// 无条件独立递增：每个真实 tool 块都以 content_block_stop 结束
+			// （复位 inTool），不能用 inTool 守卫判断新块。
 			idx := s.toolIdx
+			s.toolIdx++
+			s.inTool = true
 			chunk := s.chunk(StreamChoice{
 				Delta: ChatMessage{ToolCalls: []ToolCall{{
 					Index:    &idx,
@@ -106,7 +106,10 @@ func (s *C2OStream) Write(frame []byte) ([][]byte, error) {
 			}
 			return [][]byte{s.chunk(StreamChoice{Delta: ChatMessage{Content: ev.Delta.Text}})}, nil
 		case "input_json_delta":
-			idx := s.toolIdx
+			if s.toolIdx == 0 { // 防御：无 tool 块时不应出现参数增量
+				return nil, nil
+			}
+			idx := s.toolIdx - 1 // 当前（最近开始）tool 块的索引
 			return [][]byte{s.chunk(StreamChoice{Delta: ChatMessage{ToolCalls: []ToolCall{{Index: &idx, Function: ToolCallFunction{Arguments: ev.Delta.PartialJSON}}}}})}, nil
 		case "thinking_delta", "signature_delta":
 			return nil, nil // 剥离

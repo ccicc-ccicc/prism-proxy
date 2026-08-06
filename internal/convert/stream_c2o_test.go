@@ -1,6 +1,8 @@
 package convert
 
 import (
+	"bytes"
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -89,5 +91,48 @@ func TestParseClaudeFrame(t *testing.T) {
 	event, data, err := ParseClaudeFrame([]byte("event: content_block_delta\ndata: {\"x\":1}\n\n"))
 	if err != nil || event != EventContentBlockDelta || string(data) != `{"x":1}` {
 		t.Fatalf("parse: %s %s %v", event, data, err)
+	}
+}
+
+// 连续两个 tool_use 块（各 start → delta → stop）：toolIdx 独立计数，
+// 第一块 tool_calls index=0、第二块 index=1，参数增量携带当前块的 index。
+func TestC2OStream_ToolCalls_MultipleBlocks(t *testing.T) {
+	s := NewC2OStream("claude-3")
+	var out [][]byte
+	for _, f := range []string{
+		"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"f1\",\"input\":{}}}\n\n",
+		"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"x\\\":1}\"}}\n\n",
+		"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+		"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_2\",\"name\":\"f2\",\"input\":{}}}\n\n",
+		"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"y\\\":2}\"}}\n\n",
+		"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+	} {
+		frames, err := s.Write([]byte(f))
+		if err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, frames...)
+	}
+	if len(out) != 4 {
+		t.Fatalf("expected 4 chunks, got %d", len(out))
+	}
+	// 两块的 start 与 args 增量：tool_calls index 依次为 0、0、1、1
+	want := []int{0, 0, 1, 1}
+	for i, w := range want {
+		line := bytes.TrimSuffix(bytes.TrimPrefix(out[i], []byte("data: ")), []byte("\n\n"))
+		var ch StreamChunk
+		if err := json.Unmarshal(line, &ch); err != nil {
+			t.Fatalf("chunk %d unmarshal: %v", i, err)
+		}
+		if len(ch.Choices) != 1 || len(ch.Choices[0].Delta.ToolCalls) != 1 || ch.Choices[0].Delta.ToolCalls[0].Index == nil {
+			t.Fatalf("chunk %d: unexpected tool_calls shape: %s", i, line)
+		}
+		if got := *ch.Choices[0].Delta.ToolCalls[0].Index; got != w {
+			t.Fatalf("chunk %d: tool_calls index = %d, want %d", i, got, w)
+		}
+	}
+	// 顺序校验：第一块 id=toolu_1、第二块 id=toolu_2
+	if !strings.Contains(string(out[0]), "\"id\":\"toolu_1\"") || !strings.Contains(string(out[2]), "\"id\":\"toolu_2\"") {
+		t.Fatalf("tool ids out of order: %s / %s", out[0], out[2])
 	}
 }
