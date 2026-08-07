@@ -171,7 +171,7 @@ msg="config reloaded" path=prism-proxy.yaml
 | `outbound_response` | 回写客户端的响应体（脱敏后；同格式透传时与 upstream_response 相同） |
 | `error` | 错误信息（成功为空） |
 
-脱敏规则：四段内容统一处理，JSON 中 `api_key` / `key` 字段的值替换为 `sk-***`；非 JSON 内容原样记录；认证头（`Authorization`、`x-api-key`）不进入日志。日志写入失败不阻塞请求（仅记录 slog 错误）。流式内容超 32MB 时转写日志目录临时文件（内容完整记录，不截断）。
+脱敏规则：四段内容统一处理，JSON 中 `api_key` / `key` 字段的值替换为 `sk-***`；非 JSON 内容原样记录；认证头（`Authorization`、`x-api-key`）不进入日志。日志写入失败不阻塞请求（仅记录 slog 错误）。流式内容超 32MB 时转写日志目录临时文件（内容完整记录，不截断）。单条日志（含流式响应）超过 100MB 时该条将被丢弃并记录 slog 告警（lumberjack 单次写入上限）。
 
 ## 验证方法
 
