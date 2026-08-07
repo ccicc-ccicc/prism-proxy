@@ -1,11 +1,18 @@
-# prism-proxy 配置示例（复制为 prism-proxy.yaml 后按需修改）
-# 启动: prism-proxy serve --config prism-proxy.yaml
+# prism-proxy 配置示例（复制为 ~/.prism-proxy/settings.yaml 后按需修改）
+# 启动: prism-proxy serve           # 缺省读取 ~/.prism-proxy/settings.yaml
+#       prism-proxy serve --config prism-proxy.yaml   # 显式指定
 
 server:
   listen: ":8787"            # 监听地址；默认 ":8787"
   auth_keys: []              # 认证密钥列表；空 = 关闭认证（任意 key 均可访问）
                              # 例: ["sk-proxy-1"]；OpenAI 客户端走 Authorization: Bearer <key>，
                              #   Claude 客户端走 x-api-key: <key>
+
+logging:
+  enabled: false                 # 内容日志开关；true 时记录每请求完整四段内容
+  dir: ~/.prism-proxy/logs       # 日志目录；默认 ~/.prism-proxy/logs（~ 会展开）
+  max_files: 3                   # 轮转保留旧文件数（traffic.log.1, .2, ...）；0 = 不删除
+                                 # 轮转阈值 lumberjack 默认 100MB；dir/max_files 变更需重启
 
 auto_switch_vision: true     # 带图请求自动切换到 vision 上游；false = 永不切换
                              # true 时必须有 vision 上游，否则启动 fail-fast 报错

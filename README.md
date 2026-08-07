@@ -12,6 +12,8 @@
 - **认证（可选）**：`auth_keys` 为空关闭认证；配置后 `Authorization: Bearer` 与 `x-api-key` 两个头都查，任一命中即过（与入口路径无关）。
 - **结构化日志**：每请求一行 slog JSON，含耗时与错误信息（见下方日志字段表）。
 - **上游错误原样透传**：上游非 2xx（429/500 等）状态码与错误体不转换、原样回写客户端。
+- **默认配置路径**：`serve` 缺省读取 `~/.prism-proxy/settings.yaml`，不存在则启动失败（提示旧默认迁移）；可用 `--config` 显式指定。
+- **内容日志（traffic log）**：`logging.enabled: true` 时，每请求一条 JSONL 记录客户端请求、出站请求、上游响应、出站响应四段完整内容（`api_key`/`key` 字段脱敏），写入 `~/.prism-proxy/logs/traffic.log`，100MB 轮转保留 `max_files` 个旧文件。
 
 ## 安装构建
 
@@ -27,7 +29,8 @@ go build -o prism-proxy ./cmd/prism-proxy
 
 ```bash
 prism-proxy version              # 打印版本
-prism-proxy serve --config prism-proxy.yaml   # 启动代理（默认配置路径 prism-proxy.yaml）
+prism-proxy serve                # 启动代理（缺省配置 ~/.prism-proxy/settings.yaml）
+prism-proxy serve --config prism-proxy.yaml   # 指定配置
 ```
 
 ## 配置说明
@@ -56,6 +59,12 @@ vision:                  # 可选；auto_switch_vision: true 时必填（否则�
   format: claude
   model: "claude-3-5-sonnet"
 ```
+
+`logging` 段（可选，默认关闭）：
+- `enabled`：内容日志开关，默认 `false`。`enabled` 支持热切换（运行中改配置自动生效）；`dir`/`max_files` 变更需重启。
+- `dir`：日志目录，默认 `~/.prism-proxy/logs`（支持 `~` 前缀展开；若为相对路径按当前工作目录）。
+- `max_files`：轮转保留的旧文件数，默认 `3`（`traffic.log`、`traffic.log.1`、...）。
+- 轮转阈值固定为 lumberjack 默认 100MB。
 
 ## 路由规则
 
@@ -112,6 +121,8 @@ msg="config reloaded" path=prism-proxy.yaml
 
 配置校验失败时保留旧配置并记 `config reload failed, keeping old config`，服务不中断。支持编辑器原子写（rename/create/remove 替换）与 vim 风格 two-phase 保存。
 
+`logging.enabled` 支持热切换（true→false 停止内容日志；false→true 需重启，因 TrafficLog 在启动时构造）。
+
 ## 日志字段
 
 每请求一行（slog JSON，`msg="proxy_request"`），两协议入口同格式：
@@ -136,6 +147,29 @@ msg="config reloaded" path=prism-proxy.yaml
 ```
 
 配置加载/热加载变更单独记 `config reloaded` 日志；上游请求失败回 502（`upstream error: ...`）。
+
+## 内容日志（traffic log）
+
+`logging.enabled: true` 时，每个请求写一条 JSONL 到 `<dir>/traffic.log`，字段：
+
+| 字段 | 含义 |
+|---|---|
+| `ts` | 请求开始时间（RFC3339） |
+| `request_id` | 请求 ID，同时写入响应头 `X-Request-Id` 与 slog `proxy_request` 行的 `request_id` 字段，用于关联 |
+| `inbound` | 入站协议 `openai` / `claude` |
+| `upstream` | 路由目标 `main` / `vision` |
+| `outbound` | 上游协议 |
+| `model` | 改写后的模型名 |
+| `stream` | 是否流式 |
+| `status` | 回写客户端的状态码 |
+| `duration_ms` | 请求耗时 |
+| `inbound_body` | 客户端请求体（脱敏后） |
+| `outbound_body` | 发给上游的请求体（脱敏后） |
+| `upstream_response` | 上游响应体（流式为完整 SSE 文本，脱敏后） |
+| `outbound_response` | 回写客户端的响应体（脱敏后；同格式透传时与 upstream_response 相同） |
+| `error` | 错误信息（成功为空） |
+
+脱敏规则：四段内容统一处理，JSON 中 `api_key` / `key` 字段的值替换为 `sk-***`；非 JSON 内容原样记录；认证头（`Authorization`、`x-api-key`）不进入日志。日志写入失败不阻塞请求（仅记录 slog 错误）。流式内容超 32MB 时转写日志目录临时文件（内容完整记录，不截断）。
 
 ## 验证方法
 
@@ -177,4 +211,4 @@ go test ./... -coverprofile=/tmp/cov.out && go tool cover -func=/tmp/cov.out | t
 
 ## 非目标（有意不做）
 
-无速率限制、无多租户配额、无鉴权粒度细分（全局 auth_keys）、无日志采样/审计持久化。详见设计文档 [docs/superpowers/specs/2026-08-06-prism-proxy-design.md](docs/superpowers/specs/2026-08-06-prism-proxy-design.md)。
+无速率限制、无多租户配额、无鉴权粒度细分（全局 auth_keys）、无日志采样。内容日志由 `logging.enabled` 开关控制，`dir`/`max_files` 不支持热更新（仅 `enabled` 可热切换）。详见设计文档 [docs/superpowers/specs/2026-08-07-traffic-log-design.md](docs/superpowers/specs/2026-08-07-traffic-log-design.md)。
