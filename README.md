@@ -9,13 +9,13 @@
 - **独立 vision 上游**：`main` 与 `vision` 可配不同格式/模型/密钥，互不影响。
 - **模型改写**：转发时强制改写为配置的模型名，忽略入站请求里的 `model` 字段（`vision_switch` 后走 vision 配置的模型）。
 - **配置热加载**：修改 `prism-proxy.yaml` 无需重启，自动生效（fsnotify，支持编辑器原子写）。
-- **认证（可选）**：`auth_keys` 为空关闭认证；配置后 OpenAI 客户端校验 `Authorization: Bearer`，Claude 客户端校验 `x-api-key`。
+- **认证（可选）**：`auth_keys` 为空关闭认证；配置后 `Authorization: Bearer` 与 `x-api-key` 两个头都查，任一命中即过（与入口路径无关）。
 - **结构化日志**：每请求一行 slog JSON，含耗时与错误信息（见下方日志字段表）。
 - **上游错误原样透传**：上游非 2xx（429/500 等）状态码与错误体不转换、原样回写客户端。
 
 ## 安装构建
 
-需要 Go 1.22+。
+需要 Go 1.25.5+（go.mod 声明的版本）。
 
 ```bash
 go build -o prism-proxy ./cmd/prism-proxy
@@ -93,7 +93,7 @@ curl -s http://127.0.0.1:8787/v1/chat/completions \
 ### 认证
 
 - `auth_keys: []`：认证关闭，任意 key 放行。
-- 配置了 key：OpenAI 入口校验 `Authorization: Bearer <key>`，Claude 入口校验 `x-api-key: <key>`；不匹配返回 401，错误体为入站协议信封（OpenAI 格式 `{"error":{"message":"invalid api key","type":"authentication_error"}}`，Claude 格式 `{"type":"error","error":{...}}`）。
+- 配置了 key：两个头都查——`Authorization: Bearer <key>` 与 `x-api-key: <key>` 任一命中即过（与入口路径无关）；都不匹配返回 401，错误体为入站协议信封（OpenAI 格式 `{"error":{"message":"invalid api key","type":"authentication_error"}}`，Claude 格式 `{"type":"error","error":{...}}`）。
 
 ## 安全注意事项
 

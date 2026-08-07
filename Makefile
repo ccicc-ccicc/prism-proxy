@@ -23,10 +23,12 @@ DIST_DIR := dist
 target_name = $(DIST_DIR)/$(BINARY)-$(1)-$(2)$(if $(filter windows,$(1)),.exe)
 
 # 单个平台的构建规则模板
+# 注意：build / build-all 依赖 clean（先删后建），不可并行（make -j）——
+# 并行执行时 clean 可能删除其他目标正在写入的产物目录。
 define build-rule
 $(call target_name,$(1),$(2)):
 	mkdir -p $(DIST_DIR)
-	env GOOS=$(1) GOARCH=$(2) CGO_ENABLED=0 go build -ldflags "$(LDFLAGS)" -o $$@ $(CMD_PKG)
+	env GOOS=$(1) GOARCH=$(2) CGO_ENABLED=0 go build -trimpath -ldflags "$(LDFLAGS)" -o $$@ $(CMD_PKG)
 endef
 
 # 用 foreach 双重循环展开整个矩阵
@@ -40,7 +42,7 @@ BUILD_TARGETS := $(foreach os,$(BUILD_OS),$(foreach arch,$(BUILD_ARCH),$(call ta
 
 # 本机构建：先 clean 再构建，避免残留旧产物
 build: clean
-	go build -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/$(BINARY) $(CMD_PKG)
+	go build -trimpath -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/$(BINARY) $(CMD_PKG)
 
 # 多平台交叉构建：先 clean 再按矩阵构建
 build-all: clean $(BUILD_TARGETS)

@@ -72,8 +72,11 @@ type MessagesResponse struct {
 	Error        *ClaudeError  `json:"error,omitempty"`
 }
 
+// ClaudeUsage 的 input_tokens 仅在 message_start（及非流式 message）中上报；
+// message_delta 的 usage 按真实 Anthropic 线格式只携带 output_tokens，
+// 因此 input_tokens 用 omitempty 以在 delta 帧中省略。
 type ClaudeUsage struct {
-	InputTokens  int `json:"input_tokens"`
+	InputTokens  int `json:"input_tokens,omitempty"`
 	OutputTokens int `json:"output_tokens"`
 }
 

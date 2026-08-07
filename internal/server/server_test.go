@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -412,43 +413,54 @@ func TestErrorEnvelope_413(t *testing.T) {
 	}
 }
 
-func TestAuth_ClaudePath(t *testing.T) {
-	upstreamSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(200)
-		w.Write([]byte(`{}`))
-	}))
-	defer upstreamSrv.Close()
-	cfg := &config.Config{
-		Server: config.ServerConfig{AuthKeys: []string{"sk-proxy-1"}},
-		Upstreams: map[string]config.UpstreamConfig{
-			"main": {BaseURL: upstreamSrv.URL, APIKey: "sk", Format: "claude", Model: "claude-3-5-sonnet"},
-		},
-	}
-	srv := NewWithConfig(cfg, upstream.NewClient(), slog.Default())
-	ts := httptest.NewServer(srv)
-	defer ts.Close()
+// Minor 3: spec §3 两个头都查——Authorization: Bearer 与 x-api-key 任一命中即过，
+// 与入口路径无关（跨头携带 key 也放行）。
+func TestAuth_CrossHeader(t *testing.T) {
+	run := func(path, upFormat string) {
+		upstreamSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(200)
+			w.Write([]byte(`{}`))
+		}))
+		defer upstreamSrv.Close()
+		cfg := &config.Config{
+			Server: config.ServerConfig{AuthKeys: []string{"sk-proxy-1"}},
+			Upstreams: map[string]config.UpstreamConfig{
+				"main": {BaseURL: upstreamSrv.URL, APIKey: "sk", Format: upFormat, Model: "m"},
+			},
+		}
+		srv := NewWithConfig(cfg, upstream.NewClient(), slog.Default())
+		ts := httptest.NewServer(srv)
+		defer ts.Close()
 
-	req, _ := http.NewRequest("POST", ts.URL+"/v1/messages", strings.NewReader(`{"messages":[]}`))
-	req.Header.Set("Authorization", "Bearer sk-proxy-1")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
+		// 每个路径 × 每个头（含跨头：非规范头携带 key）都必须放行
+		for _, header := range []string{"Authorization: Bearer sk-proxy-1", "x-api-key: sk-proxy-1"} {
+			req, _ := http.NewRequest("POST", ts.URL+path, strings.NewReader(`{"messages":[]}`))
+			parts := strings.SplitN(header, ": ", 2)
+			req.Header.Set(parts[0], parts[1])
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp.Body.Close()
+			if resp.StatusCode != 200 {
+				t.Fatalf("%s on %s: %d, want 200", header, path, resp.StatusCode)
+			}
+		}
+		// 错误 key（任一头的值不匹配）→ 401
+		req, _ := http.NewRequest("POST", ts.URL+path, strings.NewReader(`{"messages":[]}`))
+		req.Header.Set("x-api-key", "wrong-key")
+		req.Header.Set("Authorization", "Bearer also-wrong")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != 401 {
+			t.Fatalf("wrong keys on %s: %d, want 401", path, resp.StatusCode)
+		}
 	}
-	resp.Body.Close()
-	if resp.StatusCode != 401 {
-		t.Fatalf("bearer on claude path: %d", resp.StatusCode)
-	}
-
-	req2, _ := http.NewRequest("POST", ts.URL+"/v1/messages", strings.NewReader(`{"messages":[]}`))
-	req2.Header.Set("x-api-key", "sk-proxy-1")
-	resp2, err := http.DefaultClient.Do(req2)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp2.Body.Close()
-	if resp2.StatusCode != 200 {
-		t.Fatalf("x-api-key on claude path: %d", resp2.StatusCode)
-	}
+	run("/v1/chat/completions", "openai")
+	run("/v1/messages", "claude")
 }
 
 func TestUpstreamError(t *testing.T) {
@@ -473,6 +485,38 @@ func TestUpstreamError(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusBadGateway {
 		t.Fatalf("upstream down: %d", resp.StatusCode)
+	}
+}
+
+// Minor 9: 502 错误体不得回显上游 URL（完整错误含 URL，保留在服务端日志）。
+func TestUpstreamError_NoURLInClientBody(t *testing.T) {
+	upstreamSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	dead := upstreamSrv.URL
+	upstreamSrv.Close() // 连接被拒绝 → client.Do 报错（错误串含上游 URL）
+	cfg := &config.Config{
+		Upstreams: map[string]config.UpstreamConfig{
+			"main": {BaseURL: dead + "/v1", APIKey: "sk", Format: "openai", Model: "gpt-4o"},
+		},
+	}
+	srv := NewWithConfig(cfg, upstream.NewClient(), slog.Default())
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+	resp, err := http.Post(ts.URL+"/v1/chat/completions", "application/json",
+		strings.NewReader(`{"messages":[]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("upstream down: %d", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	u, perr := url.Parse(dead)
+	if perr != nil {
+		t.Fatal(perr)
+	}
+	if strings.Contains(string(body), u.Host) {
+		t.Fatalf("client-visible 502 body leaks upstream host %q: %s", u.Host, body)
 	}
 }
 

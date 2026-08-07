@@ -128,6 +128,23 @@ func TestO2CStream_FramesWellFormed(t *testing.T) {
 	if ev.Message == nil || ev.Message.Role != "assistant" {
 		t.Fatalf("message_start payload: %+v", ev.Message)
 	}
+	// Important 2: data 负载的 type 必须等于事件名（真实 Anthropic 线格式）
+	if ev.Type != EventMessageStart {
+		t.Fatalf("data.type = %q, want %q (%s)", ev.Type, EventMessageStart, f)
+	}
+}
+
+// Important 2: 每帧 data 负载的 type 字段必须等于事件名（message_start、message_stop）。
+func TestO2CStream_FrameDataTypeMatchesEvent(t *testing.T) {
+	s := NewO2CStream()
+	out, _ := s.Write([]byte(`{"choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}`))
+	out = append(out, s.Finish()...)
+	for i, want := range []string{EventMessageStart, EventMessageStop} {
+		ev := decodeEvent(t, out[i])
+		if ev.Type != want {
+			t.Fatalf("frame %d: data.type = %q, want %q (%s)", i, ev.Type, want, out[i])
+		}
+	}
 }
 
 // Critical 1: finish_reason 到达时打开的 tool_use 块必须先 content_block_stop，
@@ -249,7 +266,8 @@ func TestO2CStream_MessageDeltaNested(t *testing.T) {
 	}
 }
 
-// Important 3: usage-only message_delta 恒带 delta 对象（{}），usage 随帧携带。
+// Important 3: usage-only message_delta 恒带 delta 对象（{}），usage 随帧携带；
+// 真实 Claude delta 的 usage 只含 output_tokens（input_tokens 已随 message_start 上报）。
 func TestO2CStream_MessageDeltaUsageOnly(t *testing.T) {
 	s := NewO2CStream()
 	_, _ = s.Write([]byte(`{"choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}`))
@@ -261,8 +279,11 @@ func TestO2CStream_MessageDeltaUsageOnly(t *testing.T) {
 	if ev.Delta == nil {
 		t.Fatalf("usage-only message_delta must still carry delta: %+v", ev)
 	}
-	if ev.Usage == nil || ev.Usage.InputTokens != 10 || ev.Usage.OutputTokens != 5 {
+	if ev.Usage == nil || ev.Usage.OutputTokens != 5 {
 		t.Fatalf("usage payload: %+v", ev.Usage)
+	}
+	if strings.Contains(string(out[0]), "input_tokens") {
+		t.Fatalf("delta usage must not carry input_tokens: %s", out[0])
 	}
 }
 
@@ -284,7 +305,8 @@ func TestO2CStream_FinishUsageMerged(t *testing.T) {
 	}
 }
 
-// Minor 5: usage chunk → message_delta{usage}，prompt/completion tokens 正确映射。
+// Minor 5: usage chunk → message_delta{usage}，delta usage 只映射 output_tokens
+// （input_tokens 已随 message_start 上报，不重复携带）。
 func TestO2CStream_UsageDelta(t *testing.T) {
 	s := NewO2CStream()
 	_, _ = s.Write([]byte(`{"choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}`))
@@ -293,7 +315,7 @@ func TestO2CStream_UsageDelta(t *testing.T) {
 		t.Fatalf("usage frame: %s", out[0])
 	}
 	ev := decodeEvent(t, out[0])
-	if ev.Usage == nil || ev.Usage.InputTokens != 10 || ev.Usage.OutputTokens != 5 {
+	if ev.Usage == nil || ev.Usage.OutputTokens != 5 {
 		t.Fatalf("usage payload: %+v", ev.Usage)
 	}
 }

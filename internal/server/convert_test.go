@@ -366,6 +366,150 @@ func TestTimeoutReader_StalledUpstream(t *testing.T) {
 	}
 }
 
+// Important 1: C2O 上游流干净 EOF（无 message_stop，如服务端超时中断）→
+// 客户端拿不到 [DONE]，已回写内容保留，截断错误记日志（不伪造结束事件）。
+func TestC2OStream_EOFAccessNoMessageStop_NoDONE(t *testing.T) {
+	frames := []string{
+		"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-3\",\"content\":[]}}\n\n",
+		"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
+		// 无 message_stop：上游正常关闭连接（如服务端超时）
+	}
+	upstreamSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		fl, _ := w.(http.Flusher)
+		for _, f := range frames {
+			w.Write([]byte(f))
+			fl.Flush()
+		}
+	}))
+	defer upstreamSrv.Close()
+	cfg := &config.Config{
+		Upstreams: map[string]config.UpstreamConfig{
+			"main": {BaseURL: upstreamSrv.URL + "/v1", APIKey: "sk", Format: "claude", Model: "claude-3"},
+		},
+	}
+	cap := &captureHandler{}
+	srv := NewWithConfig(cfg, upstream.NewClient(), slog.New(cap))
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+	resp, err := http.Post(ts.URL+"/v1/chat/completions", "application/json",
+		strings.NewReader(`{"model":"x","messages":[{"role":"user","content":"hi"}],"stream":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	// 截断前已回写的内容必须保留
+	if !strings.Contains(string(body), "hi") {
+		t.Fatalf("missing converted content: %s", body)
+	}
+	// EOF 未收 message_stop → 绝不伪造 [DONE]
+	if strings.Contains(string(body), "[DONE]") {
+		t.Fatalf("fabricated [DONE] on truncated stream: %s", body)
+	}
+	// 日志必须记录截断
+	cap.mu.Lock()
+	defer cap.mu.Unlock()
+	found := false
+	for _, l := range cap.lines {
+		if strings.Contains(l, "proxy_request") && strings.Contains(l, "truncated") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("no truncation log line: %v", cap.lines)
+	}
+}
+
+// Important 1: O2C 上游流裸 EOF（无 [DONE]）→ 客户端拿不到 message_stop，
+// 已回写内容保留，截断错误记日志（不伪造结束事件）。
+func TestO2CStream_EOFAccessNoDONE_NoMessageStop(t *testing.T) {
+	upstreamSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		fl, _ := w.(http.Flusher)
+		w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"))
+		fl.Flush()
+		// 无 data: [DONE]：上游正常关闭连接（如服务端超时）
+	}))
+	defer upstreamSrv.Close()
+	cfg := &config.Config{
+		Upstreams: map[string]config.UpstreamConfig{
+			"main": {BaseURL: upstreamSrv.URL + "/v1", APIKey: "sk", Format: "openai", Model: "gpt-4o"},
+		},
+	}
+	cap := &captureHandler{}
+	srv := NewWithConfig(cfg, upstream.NewClient(), slog.New(cap))
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+	resp, err := http.Post(ts.URL+"/v1/messages", "application/json",
+		strings.NewReader(`{"model":"x","max_tokens":1024,"messages":[{"role":"user","content":"hi"}],"stream":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	// 截断前已转换的内容必须回写
+	if !strings.Contains(string(body), "content_block_delta") {
+		t.Fatalf("missing converted frames: %s", body)
+	}
+	// 裸 EOF 无 [DONE] → 绝不伪造 message_stop
+	if strings.Contains(string(body), "message_stop") {
+		t.Fatalf("fabricated message_stop on truncated stream: %s", body)
+	}
+	// 日志必须记录截断
+	cap.mu.Lock()
+	defer cap.mu.Unlock()
+	found := false
+	for _, l := range cap.lines {
+		if strings.Contains(l, "proxy_request") && strings.Contains(l, "truncated") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("no truncation log line: %v", cap.lines)
+	}
+}
+
+// Important 1 happy path: O2C 上游流正常结束（data: [DONE]）→ message_stop 仍须发射。
+func TestO2CStream_DONE_EmitsMessageStop(t *testing.T) {
+	upstreamSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		fl, _ := w.(http.Flusher)
+		w.Write([]byte("data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}\n\n"))
+		fl.Flush()
+		w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"))
+		fl.Flush()
+		w.Write([]byte("data: [DONE]\n\n"))
+		fl.Flush()
+	}))
+	defer upstreamSrv.Close()
+	cfg := &config.Config{
+		Upstreams: map[string]config.UpstreamConfig{
+			"main": {BaseURL: upstreamSrv.URL + "/v1", APIKey: "sk", Format: "openai", Model: "gpt-4o"},
+		},
+	}
+	srv := NewWithConfig(cfg, upstream.NewClient(), slog.Default())
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+	resp, err := http.Post(ts.URL+"/v1/messages", "application/json",
+		strings.NewReader(`{"model":"x","max_tokens":1024,"messages":[{"role":"user","content":"hi"}],"stream":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("status: %d", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	s := string(body)
+	if !strings.Contains(s, "message_stop") {
+		t.Fatalf("[DONE] seen but message_stop missing: %s", s)
+	}
+}
+
 // Critical 1: C2O 流中途上游 error 事件 → 已回写内容保留，但客户端拿不到 [DONE]，
 // proxy_request 日志记录 error（不把截断流伪装成成功）。
 func TestC2OStream_ErrorEvent_NoDONE(t *testing.T) {

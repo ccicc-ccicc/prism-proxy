@@ -102,7 +102,7 @@ func TestMatrix_StreamingAllQuadrants(t *testing.T) {
 	// 断言子串对齐状态机实际输出：
 	//   - C2O chunk 的 delta 按 struct 字段序为 {"role":...,"content":...}，
 	//     故 openai 客户端断言 "content":"hi"（顺序稳定的子串）；
-	//   - O2C 帧的 data 行 type 字段为空（事件名在 event: 行），
+	//   - O2C 帧的 data 行 type 字段等于事件名（如 message_delta），
 	//     故 claude 客户端断言 event 行 + delta 内容子串。
 	quadrants := []struct {
 		inboundFormat, upstreamFormat, path, reqBody, upStream, clientChunk, clientChunkExtra string

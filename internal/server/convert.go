@@ -83,7 +83,8 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, up *config.Upst
 	resp, err := s.client.Do(r.Context(), up, outbound, false)
 	if err != nil {
 		s.log(start, inboundFormat, d, *up, http.StatusBadGateway, false, err)
-		writeError(w, inboundFormat, http.StatusBadGateway, "upstream error: "+err.Error())
+		// 客户端可见消息不含上游 URL（完整错误含 URL，保留在服务端日志）
+		writeError(w, inboundFormat, http.StatusBadGateway, "upstream request failed")
 		return nil
 	}
 	defer resp.Body.Close()
@@ -198,6 +199,11 @@ func (s *Server) convertStream(ctx context.Context, w http.ResponseWriter, src i
 			}
 			return nil
 		}, func() error {
+			// 上游 EOF 但从未收到 message_stop → 截断流（如服务端超时中断）：
+			// 绝不伪造 [DONE]，返回 error 由调用方记日志
+			if !c.Stopped() {
+				return fmt.Errorf("truncated claude stream: EOF without message_stop")
+			}
 			for _, o := range c.Close() {
 				_, _ = w.Write(o)
 			}
@@ -212,13 +218,19 @@ func (s *Server) convertStream(ctx context.Context, w http.ResponseWriter, src i
 	c := convert.NewO2CStreamWithModel(model)
 	scanner := &openAISSE{}
 	var streamErr error
+	doneSeen := false
 	for {
 		data, done, err := scanner.Next(src)
 		if done {
+			doneSeen = true // 收到 [DONE]：正常结束
 			break
 		}
 		if err != nil {
-			if !errors.Is(err, io.EOF) {
+			if errors.Is(err, io.EOF) {
+				// 裸 EOF 无 [DONE] → 截断流（如服务端超时中断）：
+				// 不伪造 message_stop，返回 error 由调用方记日志
+				streamErr = fmt.Errorf("truncated openai stream: EOF without [DONE]")
+			} else {
 				streamErr = err // 断流/读超时：不伪造结束帧
 			}
 			break
@@ -236,8 +248,8 @@ func (s *Server) convertStream(ctx context.Context, w http.ResponseWriter, src i
 			fl.Flush()
 		}
 	}
-	// 仅正常结束才发 message_stop；中途错误静默断流（由调用方记日志）
-	if streamErr == nil {
+	// 仅收到 [DONE] 才发 message_stop；中途错误/裸 EOF 静默断流（由调用方记日志）
+	if doneSeen {
 		for _, o := range c.Finish() {
 			_, _ = w.Write(o)
 		}

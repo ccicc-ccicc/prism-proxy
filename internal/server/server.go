@@ -58,7 +58,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	cfg := s.cfg.Get()
-	if !s.authenticated(r, format, cfg) {
+	if !s.authenticated(r, cfg) {
 		writeError(w, format, http.StatusUnauthorized, "invalid api key")
 		return
 	}
@@ -158,19 +158,17 @@ func readWithCtx(ctx context.Context, src io.Reader, buf []byte) ([]byte, error)
 	}
 }
 
-func (s *Server) authenticated(r *http.Request, format string, cfg *config.Config) bool {
+func (s *Server) authenticated(r *http.Request, cfg *config.Config) bool {
 	keys := cfg.Server.AuthKeys
 	if len(keys) == 0 {
 		return true
 	}
-	var got string
-	if format == "claude" {
-		got = r.Header.Get("x-api-key")
-	} else {
-		got = strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-	}
+	// spec §3：两个头都查（Authorization: Bearer 与 x-api-key），任一命中即过，
+	// 与入口路径无关。
+	auth := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	apiKey := r.Header.Get("x-api-key")
 	for _, k := range keys {
-		if got == k {
+		if auth == k || apiKey == k {
 			return true
 		}
 	}

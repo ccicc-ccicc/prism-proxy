@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"time"
 )
 
 // C2OStream 将 Claude SSE 帧转换为 OpenAI SSE chunk（spec §5 的 C2O 绑定）。
@@ -26,6 +27,7 @@ type C2OStream struct {
 	toolIdx   int // 下一个 tool_use 块的索引（只对 tool_use 独立计数）
 	inTool    bool
 	lastChunk []byte
+	stopped   bool // 是否收到 message_stop（上游完整结束标志）
 }
 
 func NewC2OStream(model string) *C2OStream {
@@ -158,6 +160,7 @@ func (s *C2OStream) Write(frame []byte) ([][]byte, error) {
 		}
 		return out, nil
 	case EventMessageStop:
+		s.stopped = true
 		return nil, nil
 	default:
 		// 未知事件（含 stats）：吞掉
@@ -178,10 +181,15 @@ func finishReasonC2O(reason string) string {
 	}
 }
 
+// Stopped 报告是否已收到 message_stop。上游未发 message_stop 即 EOF 属截断流，
+// 调用方不得回写 [DONE]（不伪造结束事件）。
+func (s *C2OStream) Stopped() bool { return s.stopped }
+
 func (s *C2OStream) chunk(choice StreamChoice) []byte {
 	b, _ := json.Marshal(StreamChunk{
 		ID:      s.id,
 		Object:  "chat.completion.chunk",
+		Created: time.Now().Unix(), // 真实时间戳（非 0）
 		Model:   s.model,
 		Choices: []StreamChoice{{Index: 0, Delta: choice.Delta, FinishReason: choice.FinishReason}},
 	})

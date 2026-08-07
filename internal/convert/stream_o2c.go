@@ -53,8 +53,9 @@ func (s *O2CStream) Write(data []byte) ([][]byte, error) {
 	}
 	if len(chunk.Choices) == 0 {
 		if chunk.Usage != nil {
-			// message_delta 恒带 delta 对象（usage-only 时为 {}），usage 随帧携带
-			frames = append(frames, s.frame(EventMessageDelta, StreamEvent{Delta: &ClaudeDelta{}, Usage: &ClaudeUsage{InputTokens: chunk.Usage.PromptTokens, OutputTokens: chunk.Usage.CompletionTokens}}))
+			// message_delta 恒带 delta 对象（usage-only 时为 {}）；真实 Claude delta 的
+			// usage 仅携带 output_tokens（input_tokens 已随 message_start 上报）
+			frames = append(frames, s.frame(EventMessageDelta, StreamEvent{Delta: &ClaudeDelta{}, Usage: &ClaudeUsage{OutputTokens: chunk.Usage.CompletionTokens}}))
 		}
 		return frames, nil
 	}
@@ -104,7 +105,8 @@ func (s *O2CStream) Write(data []byte) ([][]byte, error) {
 		}
 		frames = append(frames, s.frame(EventMessageDelta, ev))
 	} else if chunk.Usage != nil {
-		frames = append(frames, s.frame(EventMessageDelta, StreamEvent{Delta: &ClaudeDelta{}, Usage: &ClaudeUsage{InputTokens: chunk.Usage.PromptTokens, OutputTokens: chunk.Usage.CompletionTokens}}))
+		// 无 stop_reason 的 usage 帧：delta usage 仅携带 output_tokens
+		frames = append(frames, s.frame(EventMessageDelta, StreamEvent{Delta: &ClaudeDelta{}, Usage: &ClaudeUsage{OutputTokens: chunk.Usage.CompletionTokens}}))
 	}
 	return frames, nil
 }
@@ -137,6 +139,8 @@ func stopReasonO2C(reason string) *string {
 }
 
 func (s *O2CStream) frame(event string, payload StreamEvent) []byte {
+	// 真实 Anthropic 帧的 data 恒携带 type 字段（等于事件名）
+	payload.Type = event
 	b, _ := json.Marshal(payload)
 	return []byte("event: " + event + "\ndata: " + string(b) + "\n\n")
 }

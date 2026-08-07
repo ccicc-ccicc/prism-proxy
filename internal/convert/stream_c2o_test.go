@@ -106,6 +106,41 @@ func TestC2OStream_ErrorEvent(t *testing.T) {
 	}
 }
 
+// Important 1: Stopped() 标志——收到 message_stop 前为 false，收到后为 true
+// （服务端据此决定 EOF 时能否回写 [DONE]）。
+func TestC2OStream_StoppedFlag(t *testing.T) {
+	s := NewC2OStream("claude-3")
+	if s.Stopped() {
+		t.Fatal("not stopped before message_stop")
+	}
+	if _, err := s.Write([]byte("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n")); err != nil {
+		t.Fatal(err)
+	}
+	if s.Stopped() {
+		t.Fatal("delta must not mark stream stopped")
+	}
+	if _, err := s.Write([]byte("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")); err != nil {
+		t.Fatal(err)
+	}
+	if !s.Stopped() {
+		t.Fatal("stopped after message_stop")
+	}
+}
+
+// Minor 9: C2O chunk 的 created 必须是真实 unix 时间戳（非 0）。
+func TestC2OStream_ChunkCreatedTimestamp(t *testing.T) {
+	s := NewC2OStream("claude-3")
+	out, _ := s.Write([]byte("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-3\",\"content\":[]}}\n\n"))
+	line := bytes.TrimSuffix(bytes.TrimPrefix(out[0], []byte("data: ")), []byte("\n\n"))
+	var ch StreamChunk
+	if err := json.Unmarshal(line, &ch); err != nil {
+		t.Fatal(err)
+	}
+	if ch.Created == 0 {
+		t.Fatalf("created must be real unix timestamp: %s", out[0])
+	}
+}
+
 func TestParseClaudeFrame(t *testing.T) {
 	event, data, err := ParseClaudeFrame([]byte("event: content_block_delta\ndata: {\"x\":1}\n\n"))
 	if err != nil || event != EventContentBlockDelta || string(data) != `{"x":1}` {

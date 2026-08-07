@@ -1,10 +1,15 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"github.com/spf13/cobra"
 	"prism-proxy/internal/config"
@@ -52,7 +57,25 @@ func serveCmd() *cobra.Command {
 			srv := server.New(watcher, upstream.NewClient(), slog.Default())
 			logger := slog.Default()
 			logger.Info("prism-proxy listening", "addr", watcher.Get().Server.Listen, "config", configPath)
-			return http.ListenAndServe(watcher.Get().Server.Listen, srv)
+			httpServer := &http.Server{
+				Addr:              watcher.Get().Server.Listen,
+				Handler:           srv,
+				ReadHeaderTimeout: 30 * time.Second, // 慢速/恶意客户端不长期占用连接
+				IdleTimeout:       120 * time.Second,
+			}
+			// 优雅关闭：Ctrl-C / SIGTERM → 停止接收新请求并等待在途请求完成
+			ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+			defer stop()
+			go func() {
+				<-ctx.Done()
+				shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+				_ = httpServer.Shutdown(shutdownCtx)
+			}()
+			if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				return err
+			}
+			return nil
 		},
 	}
 	cmd.Flags().StringVar(&configPath, "config", "prism-proxy.yaml", "path to config file")
