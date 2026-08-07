@@ -246,8 +246,12 @@ func (r *Recorder) SetInbound(body []byte)          { _, _ = r.inboundBody.Write
 func (r *Recorder) SetOutbound(body []byte)         { _, _ = r.outboundBody.Write(body) }
 func (r *Recorder) SetUpstreamResponse(body []byte) { _, _ = r.upstreamResponse.Write(body) }
 func (r *Recorder) SetOutboundResponse(body []byte) { _, _ = r.outboundResponse.Write(body) }
-func (r *Recorder) SetError(err error)              { if err != nil { r.errMsg = err.Error() } }
-func (r *Recorder) SetStatus(status int)            { r.status = status }
+func (r *Recorder) SetError(err error) {
+	if err != nil && r.errMsg == "" {
+		r.errMsg = err.Error() // 首次记录：内层错误不被外层覆盖
+	}
+}
+func (r *Recorder) SetStatus(status int) { r.status = status }
 
 // UpstreamWriter / OutboundWriter 供流式旁路累积（TeeReader/MultiWriter）。
 func (r *Recorder) UpstreamWriter() io.Writer { return r.upstreamResponse }
@@ -256,9 +260,11 @@ func (r *Recorder) OutboundWriter() io.Writer { return r.outboundResponse }
 // Entry 组装单条日志：四段统一脱敏；outbound_response 为空时回退取
 // upstream_response（同格式透传路径内容相同）。
 func (r *Recorder) Entry(stream bool, duration time.Duration) Entry {
-	outboundResp := string(Redact([]byte(r.outboundResponse.String())))
-	if outboundResp == "" {
-		outboundResp = string(Redact([]byte(r.upstreamResponse.String())))
+	// 四段各取一次原始串再复用：落盘场景避免 String() 重复整文件读
+	upRaw := r.upstreamResponse.String()
+	outRaw := r.outboundResponse.String()
+	if outRaw == "" {
+		outRaw = upRaw
 	}
 	return Entry{
 		TS:               r.start.Format(time.RFC3339),
@@ -272,8 +278,8 @@ func (r *Recorder) Entry(stream bool, duration time.Duration) Entry {
 		DurationMS:       duration.Milliseconds(),
 		InboundBody:      string(Redact([]byte(r.inboundBody.String()))),
 		OutboundBody:     string(Redact([]byte(r.outboundBody.String()))),
-		UpstreamResponse: string(Redact([]byte(r.upstreamResponse.String()))),
-		OutboundResponse: outboundResp,
+		UpstreamResponse: string(Redact([]byte(upRaw))),
+		OutboundResponse: string(Redact([]byte(outRaw))),
 		Error:            r.errMsg,
 	}
 }

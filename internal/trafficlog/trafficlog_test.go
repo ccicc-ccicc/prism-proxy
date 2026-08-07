@@ -3,6 +3,7 @@ package trafficlog
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -246,5 +247,28 @@ func TestRecorder_OutboundFallbackToUpstream(t *testing.T) {
 	entry := rec.Entry(false, 0)
 	if entry.OutboundResponse != `{"choices":[]}` {
 		t.Fatalf("outbound fallback: %q", entry.OutboundResponse)
+	}
+}
+
+func TestRecorder_SetErrorFirstWins(t *testing.T) {
+	dir := t.TempDir()
+	rec := NewRecorder(dir, "rid", "openai")
+	defer rec.Close()
+	rec.SetError(errors.New("inner"))
+	rec.SetError(errors.New("outer"))
+	if rec.Entry(false, 0).Error != "inner" {
+		t.Fatalf("want first error, got %q", rec.Entry(false, 0).Error)
+	}
+}
+
+func TestRecorder_EntrySpillContent(t *testing.T) {
+	dir := t.TempDir()
+	rec := NewRecorder(dir, "rid", "openai")
+	defer rec.Close()
+	big := bytes.Repeat([]byte("x"), 40<<20) // 40MB 触发落盘
+	rec.SetOutboundResponse(big)
+	entry := rec.Entry(false, 0)
+	if entry.OutboundResponse != string(big) {
+		t.Fatalf("spill content mismatch: len %d want %d", len(entry.OutboundResponse), len(big))
 	}
 }
