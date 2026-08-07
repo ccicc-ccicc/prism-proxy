@@ -60,11 +60,25 @@ func (c *Client) Do(ctx context.Context, u *config.UpstreamConfig, body []byte, 
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if u.Format == "claude" {
-		req.Header.Set("x-api-key", u.APIKey)
-		req.Header.Set("anthropic-version", "2023-06-01")
-	} else {
+	// 出站认证头：显式 auth 配置优先；否则按 format 默认
+	// （openai → Authorization: Bearer，claude → x-api-key）。
+	// 网关类上游（AIGW 等）虽暴露 /v1/messages 形态，却要求 Bearer，
+	// 通过 auth: bearer 覆盖。
+	auth := u.Auth
+	if auth == "" {
+		if u.Format == "claude" {
+			auth = "x-api-key"
+		} else {
+			auth = "bearer"
+		}
+	}
+	if auth == "bearer" {
 		req.Header.Set("Authorization", "Bearer "+u.APIKey)
+	} else {
+		req.Header.Set("x-api-key", u.APIKey)
+	}
+	if u.Format == "claude" {
+		req.Header.Set("anthropic-version", "2023-06-01")
 	}
 	timeout := u.Timeout
 	if timeout <= 0 {

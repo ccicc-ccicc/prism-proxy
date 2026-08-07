@@ -25,6 +25,9 @@ type UpstreamConfig struct {
 	Format  string        `yaml:"format"`
 	Model   string        `yaml:"model"`
 	Timeout time.Duration `yaml:"timeout"`
+	// Auth 出站认证头，空 = 按 format 默认（openai → Bearer，claude → x-api-key）；
+	// 显式 "bearer" 或 "x-api-key" 覆盖。网关类上游（如 AIGW）常用 Bearer 认证。
+	Auth string `yaml:"auth"`
 }
 
 const defaultTimeout = 120 * time.Second
@@ -90,6 +93,9 @@ func validateUpstream(name string, u UpstreamConfig) error {
 	}
 	if u.Model == "" {
 		return fmt.Errorf("config: upstream %q: model is required", name)
+	}
+	if u.Auth != "" && u.Auth != "bearer" && u.Auth != "x-api-key" {
+		return fmt.Errorf("config: upstream %q: auth must be bearer or x-api-key, got %q", name, u.Auth)
 	}
 	return nil
 }

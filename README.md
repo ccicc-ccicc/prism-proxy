@@ -46,6 +46,8 @@ main:                    # 主上游（必填）
   api_key: "sk-xxxx"
   format: openai         # openai | claude
   model: "gpt-4o"
+  auth: ""               # 出站认证头：空 = 按 format 默认（openai→Bearer，claude→x-api-key）；
+                         # 显式 bearer / x-api-key 覆盖。网关类上游（AIGW）claude 形态却要求 Bearer，用 auth: bearer
   timeout: 120s          # 连接+响应头超时（Go duration 字符串），默认 120s
 
 vision:                  # 可选；auto_switch_vision: true 时必填（否则启动失败）

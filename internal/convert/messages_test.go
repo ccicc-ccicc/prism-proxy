@@ -134,6 +134,11 @@ func TestClaudeMessagesToOpenAI_Contract(t *testing.T) {
 			msgs: []ClaudeMessage{{Role: "assistant", Content: []ClaudeBlock{{Type: "thinking", Thinking: "private"}, {Type: "redacted_thinking", Thinking: "secret"}, {Type: "text", Text: "hi"}}}},
 			want: []ChatMessage{{Role: "assistant", Content: "hi"}},
 		},
+		{
+			name: "system role message merged",
+			msgs: []ClaudeMessage{{Role: "system", Content: []any{map[string]any{"type": "text", "text": "a"}}}, {Role: "user", Content: "hi"}},
+			want: []ChatMessage{{Role: "user", Content: "hi"}},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -142,7 +147,11 @@ func TestClaudeMessagesToOpenAI_Contract(t *testing.T) {
 				t.Fatal(err)
 			}
 			// 每例断言 system 放 messages[0]，其余与 want 逐条比对
-			if len(out) == 0 || out[0].Role != "system" || out[0].Content != "sys" {
+			if tc.name == "system role message merged" {
+				if len(out) == 0 || out[0].Role != "system" || out[0].Content != "sys\na" {
+					t.Fatalf("merged system: %+v", out[0].Content)
+				}
+			} else if len(out) == 0 || out[0].Role != "system" || out[0].Content != "sys" {
 				t.Fatalf("system first: %+v", out)
 			}
 			out = out[1:]

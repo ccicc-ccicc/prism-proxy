@@ -92,6 +92,11 @@ func TestValidateUpstreamFieldRules(t *testing.T) {
 			cfg:     &Config{Upstreams: map[string]UpstreamConfig{"main": {BaseURL: "b", APIKey: "k", Format: "openai"}}},
 			wantErr: "model",
 		},
+		{
+			name:    "invalid auth",
+			cfg:     &Config{Upstreams: map[string]UpstreamConfig{"main": {BaseURL: "b", APIKey: "k", Format: "openai", Model: "m", Auth: "magic"}}},
+			wantErr: "auth must be bearer or x-api-key",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
