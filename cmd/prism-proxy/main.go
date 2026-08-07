@@ -12,6 +12,10 @@ import (
 	"prism-proxy/internal/upstream"
 )
 
+// version 为编译期注入的版本号，默认 dev；构建时通过
+// -ldflags "-X main.version=$(VERSION)" 覆盖
+var version = "dev"
+
 func main() {
 	root := &cobra.Command{
 		Use:   "prism-proxy",
@@ -29,7 +33,7 @@ func versionCmd() *cobra.Command {
 		Use:   "version",
 		Short: "Print version",
 		Run: func(cmd *cobra.Command, args []string) {
-			fmt.Println("prism-proxy 0.1.0")
+			fmt.Println("prism-proxy " + version)
 		},
 	}
 }
