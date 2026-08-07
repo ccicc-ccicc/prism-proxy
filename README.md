@@ -33,6 +33,8 @@ prism-proxy serve                # 启动代理（缺省配置 ~/.prism-proxy/se
 prism-proxy serve --config prism-proxy.yaml   # 指定配置
 ```
 
+注意：`--config` 显式传入的路径不做 `~` 展开（仅缺省路径会展开）。
+
 ## 配置说明
 
 完整字段注释见 [prism-proxy.yaml.example](prism-proxy.yaml.example)，复制为 `prism-proxy.yaml` 后修改。启动时配置校验失败会 **fail-fast** 直接报错退出（例如缺少 `main` 上游、`format` 非法、`auto_switch_vision: true` 但没有 `vision` 上游）。

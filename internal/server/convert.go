@@ -147,6 +147,7 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, up *config.Upst
 		}
 		if rec != nil {
 			rec.SetStatus(resp.StatusCode)
+			rec.SetError(copyErr) // 非 EOF 的断流错误填充 error 字段
 		}
 		s.log(start, inboundFormat, d, *up, resp.StatusCode, isStream, copyErr, rec)
 		return nil
@@ -160,6 +161,7 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, up *config.Upst
 		// 失败停止转发（已完成回写的部分保留），不伪造结束事件
 		if rec != nil {
 			rec.SetStatus(resp.StatusCode)
+			rec.SetError(cerr) // 断流/转换失败填充 error 字段（首次记录，成功 nil 不覆盖）
 		}
 		s.log(start, inboundFormat, d, *up, resp.StatusCode, true, cerr, rec)
 		return nil

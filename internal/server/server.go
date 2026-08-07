@@ -96,13 +96,16 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(body) > maxBody {
 		if rec != nil {
-			rec.SetError(errResponseTooLarge)
+			rec.SetError(fmt.Errorf("request too large: %d bytes exceeds %d", len(body), maxBody))
 			rec.SetStatus(http.StatusRequestEntityTooLarge)
 		}
 		writeError(w, format, http.StatusRequestEntityTooLarge, "request too large", rec)
 		return
 	}
 	stream = requestStream(format, body)
+	if rec != nil {
+		rec.SetInbound(body)
+	}
 	decision, err := route.Decide(cfg, format, body)
 	if err != nil {
 		if rec != nil {
@@ -115,7 +118,6 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if rec != nil {
 		up := cfg.Upstreams[decision.Upstream]
 		rec.SetDecision(decision.Upstream, up.Format, decision.Model)
-		rec.SetInbound(body)
 	}
 	if err := s.relay(w, r, cfg, format, body, decision, rec); err != nil {
 		status := http.StatusBadRequest

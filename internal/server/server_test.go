@@ -771,3 +771,40 @@ func TestTrafficLog_PassthroughStreaming(t *testing.T) {
 		t.Fatalf("passthrough outbound should equal upstream")
 	}
 }
+
+// Important: 交叉格式流式截断（上游 SSE 无 [DONE]）→ convertStream 返回
+// 截断错误，traffic 条目 error 字段必须非空。
+func TestTrafficLog_TruncatedStreamErrorRecorded(t *testing.T) {
+	var buf bytes.Buffer
+	tl := trafficlog.NewWithWriter(&buf)
+	upstreamSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n")) // 无 [DONE]
+	}))
+	defer upstreamSrv.Close()
+	cfg := &config.Config{
+		Logging: config.LoggingConfig{Enabled: true, Dir: t.TempDir(), MaxFiles: 3},
+		Upstreams: map[string]config.UpstreamConfig{
+			"main": {BaseURL: upstreamSrv.URL + "/v1", APIKey: "sk", Format: "openai", Model: "gpt-4o"},
+		},
+	}
+	srv := NewWithConfig(cfg, upstream.NewClient(), slog.Default())
+	srv.SetTrafficLog(tl)
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+	resp, err := http.Post(ts.URL+"/v1/messages", "application/json",
+		strings.NewReader(`{"max_tokens":64,"stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	var e map[string]any
+	if err := json.Unmarshal([]byte(strings.TrimSpace(buf.String())), &e); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	es, _ := e["error"].(string)
+	if !strings.Contains(es, "truncated") {
+		t.Fatalf("want truncated stream error, got: %q", es)
+	}
+}
