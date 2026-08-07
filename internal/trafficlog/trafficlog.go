@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"gopkg.in/natefinch/lumberjack.v2"
 )
@@ -202,4 +203,85 @@ func (t *TrafficLog) Close() error {
 		return c.Close()
 	}
 	return nil
+}
+
+// Recorder 每请求的内容日志收集器。四段内容分别累积到 segBuffer，
+// 流式走 Writer 旁路（TeeReader/MultiWriter），Entry 时统一脱敏。
+type Recorder struct {
+	requestID string
+	inbound   string
+	upstream  string
+	outbound  string
+	model     string
+	start     time.Time
+	status    int
+	errMsg    string
+
+	inboundBody      *segBuffer
+	outboundBody     *segBuffer
+	upstreamResponse *segBuffer
+	outboundResponse *segBuffer
+}
+
+func NewRecorder(dir, requestID, inbound string) *Recorder {
+	return &Recorder{
+		requestID:        requestID,
+		inbound:          inbound,
+		start:            time.Now(),
+		inboundBody:      newSegBuffer(dir, "inbound-"+requestID),
+		outboundBody:     newSegBuffer(dir, "outbound-"+requestID),
+		upstreamResponse: newSegBuffer(dir, "upstream-"+requestID),
+		outboundResponse: newSegBuffer(dir, "outresp-"+requestID),
+	}
+}
+
+// RequestID 返回请求 ID（供 slog 关联）。
+func (r *Recorder) RequestID() string { return r.requestID }
+
+func (r *Recorder) SetDecision(upstream, outbound, model string) {
+	r.upstream, r.outbound, r.model = upstream, outbound, model
+}
+
+func (r *Recorder) SetInbound(body []byte)          { _, _ = r.inboundBody.Write(body) }
+func (r *Recorder) SetOutbound(body []byte)         { _, _ = r.outboundBody.Write(body) }
+func (r *Recorder) SetUpstreamResponse(body []byte) { _, _ = r.upstreamResponse.Write(body) }
+func (r *Recorder) SetOutboundResponse(body []byte) { _, _ = r.outboundResponse.Write(body) }
+func (r *Recorder) SetError(err error)              { if err != nil { r.errMsg = err.Error() } }
+func (r *Recorder) SetStatus(status int)            { r.status = status }
+
+// UpstreamWriter / OutboundWriter 供流式旁路累积（TeeReader/MultiWriter）。
+func (r *Recorder) UpstreamWriter() io.Writer { return r.upstreamResponse }
+func (r *Recorder) OutboundWriter() io.Writer { return r.outboundResponse }
+
+// Entry 组装单条日志：四段统一脱敏；outbound_response 为空时回退取
+// upstream_response（同格式透传路径内容相同）。
+func (r *Recorder) Entry(stream bool, duration time.Duration) Entry {
+	outboundResp := string(Redact([]byte(r.outboundResponse.String())))
+	if outboundResp == "" {
+		outboundResp = string(Redact([]byte(r.upstreamResponse.String())))
+	}
+	return Entry{
+		TS:               r.start.Format(time.RFC3339),
+		RequestID:        r.requestID,
+		Inbound:          r.inbound,
+		Upstream:         r.upstream,
+		Outbound:         r.outbound,
+		Model:            r.model,
+		Stream:           stream,
+		Status:           r.status,
+		DurationMS:       duration.Milliseconds(),
+		InboundBody:      string(Redact([]byte(r.inboundBody.String()))),
+		OutboundBody:     string(Redact([]byte(r.outboundBody.String()))),
+		UpstreamResponse: string(Redact([]byte(r.upstreamResponse.String()))),
+		OutboundResponse: outboundResp,
+		Error:            r.errMsg,
+	}
+}
+
+// Close 清理四段临时文件。
+func (r *Recorder) Close() {
+	r.inboundBody.Close()
+	r.outboundBody.Close()
+	r.upstreamResponse.Close()
+	r.outboundResponse.Close()
 }

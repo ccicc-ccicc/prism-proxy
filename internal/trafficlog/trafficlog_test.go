@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestRedact_ApiKeyNested(t *testing.T) {
@@ -191,5 +192,59 @@ func TestSegBuffer_SpillFailKeepsData(t *testing.T) {
 	// 数据保留在内存，换到可写目录后仍可成功落盘
 	if s.buf.Len() != 100 {
 		t.Fatalf("buf len=%d want 100", s.buf.Len())
+	}
+}
+
+func TestRecorder_EntryAssembly(t *testing.T) {
+	dir := t.TempDir()
+	rec := NewRecorder(dir, "rid-1", "openai")
+	defer rec.Close()
+	rec.SetDecision("main", "claude", "claude-3")
+	rec.SetInbound([]byte(`{"api_key":"sk-secret","messages":[{"role":"user","content":"hi"}]}`))
+	rec.SetOutbound([]byte(`{"model":"claude-3"}`))
+	rec.SetUpstreamResponse([]byte(`{"id":"m1"}`))
+	rec.SetOutboundResponse([]byte(`{"id":"c1"}`))
+	rec.SetStatus(200)
+	entry := rec.Entry(false, 500*time.Millisecond)
+	if entry.RequestID != "rid-1" || entry.Inbound != "openai" || entry.Upstream != "main" || entry.Outbound != "claude" || entry.Model != "claude-3" {
+		t.Fatalf("meta: %+v", entry)
+	}
+	if entry.DurationMS != 500 {
+		t.Fatalf("duration_ms=%d want 500", entry.DurationMS)
+	}
+	if !strings.Contains(entry.InboundBody, "sk-***") || strings.Contains(entry.InboundBody, "sk-secret") {
+		t.Fatalf("inbound not redacted: %s", entry.InboundBody)
+	}
+	if entry.UpstreamResponse != `{"id":"m1"}` {
+		t.Fatalf("upstream_response: %s", entry.UpstreamResponse)
+	}
+}
+
+func TestRecorder_StreamWriters(t *testing.T) {
+	dir := t.TempDir()
+	rec := NewRecorder(dir, "rid-2", "claude")
+	defer rec.Close()
+	rec.SetDecision("main", "openai", "gpt-4o")
+	rec.SetStatus(200)
+	_, _ = rec.UpstreamWriter().Write([]byte("data: {\"a\":1}\n\ndata: [DONE]\n"))
+	_, _ = rec.OutboundWriter().Write([]byte("event: message_start\n\nevent: message_stop\n"))
+	entry := rec.Entry(true, 10*time.Millisecond)
+	if entry.UpstreamResponse != "data: {\"a\":1}\n\ndata: [DONE]\n" {
+		t.Fatalf("upstream stream: %q", entry.UpstreamResponse)
+	}
+	if entry.OutboundResponse != "event: message_start\n\nevent: message_stop\n" {
+		t.Fatalf("outbound stream: %q", entry.OutboundResponse)
+	}
+}
+
+func TestRecorder_OutboundFallbackToUpstream(t *testing.T) {
+	dir := t.TempDir()
+	rec := NewRecorder(dir, "rid-3", "openai")
+	defer rec.Close()
+	rec.SetDecision("main", "openai", "gpt-4o")
+	rec.SetUpstreamResponse([]byte(`{"choices":[]}`))
+	entry := rec.Entry(false, 0)
+	if entry.OutboundResponse != `{"choices":[]}` {
+		t.Fatalf("outbound fallback: %q", entry.OutboundResponse)
 	}
 }
