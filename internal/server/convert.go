@@ -15,6 +15,7 @@ import (
 	"prism-proxy/internal/config"
 	"prism-proxy/internal/convert"
 	"prism-proxy/internal/route"
+	"prism-proxy/internal/trafficlog"
 )
 
 // 上游来源的错误（区别于请求侧转换错误，后者保持 400）：
@@ -26,7 +27,7 @@ var (
 
 // relay 处理单个请求的完整转发。format 为入站格式，up.Format 为出站格式：
 // 同格式透传，交叉格式先转换请求再转发，响应按流式/非流式反向转换。
-func (s *Server) relay(w http.ResponseWriter, r *http.Request, cfg *config.Config, format string, body []byte, d route.Decision) error {
+func (s *Server) relay(w http.ResponseWriter, r *http.Request, cfg *config.Config, format string, body []byte, d route.Decision, rec *trafficlog.Recorder) error {
 	up := cfg.Upstreams[d.Upstream]
 	stream := requestStream(format, body)
 
@@ -36,7 +37,7 @@ func (s *Server) relay(w http.ResponseWriter, r *http.Request, cfg *config.Confi
 		if err != nil {
 			return err
 		}
-		return s.forward(w, r, &up, outbound, format, d)
+		return s.forward(w, r, &up, outbound, format, d, rec)
 	}
 	// 交叉格式：转换请求
 	var outbound []byte
@@ -72,24 +73,32 @@ func (s *Server) relay(w http.ResponseWriter, r *http.Request, cfg *config.Confi
 			return err
 		}
 	}
-	return s.forward(w, r, &up, outbound, format, d)
+	return s.forward(w, r, &up, outbound, format, d, rec)
 }
 
 // forward 转发并转换响应。上游非 2xx 原样回写（不转换）；同格式透传
 // （流式走 copyStream）；交叉格式按流式/非流式转换。返回的 error 表示
 // 请求/转换失败（由调用方回 400），上游类错误已在内部回写并记日志。
-func (s *Server) forward(w http.ResponseWriter, r *http.Request, up *config.UpstreamConfig, outbound []byte, inboundFormat string, d route.Decision) error {
+// rec 非 nil 时旁路记录四段内容（上游响应 / 出站响应）。
+func (s *Server) forward(w http.ResponseWriter, r *http.Request, up *config.UpstreamConfig, outbound []byte, inboundFormat string, d route.Decision, rec *trafficlog.Recorder) error {
 	start := time.Now()
+	if rec != nil {
+		rec.SetOutbound(outbound)
+	}
 	resp, err := s.client.Do(r.Context(), up, outbound, false)
 	if err != nil {
-		s.log(start, inboundFormat, d, *up, http.StatusBadGateway, false, err)
+		if rec != nil {
+			rec.SetError(err)
+			rec.SetStatus(http.StatusBadGateway)
+		}
+		s.log(start, inboundFormat, d, *up, http.StatusBadGateway, false, err, rec)
 		// 客户端可见消息不含上游 URL（完整错误含 URL，保留在服务端日志）
-		writeError(w, inboundFormat, http.StatusBadGateway, "upstream request failed")
+		writeError(w, inboundFormat, http.StatusBadGateway, "upstream request failed", rec)
 		return nil
 	}
 	defer resp.Body.Close()
 	isStream := strings.HasPrefix(resp.Header.Get("Content-Type"), "text/event-stream")
-	// 上游非 2xx：错误体原样透传（绝不转换）
+	// 上游非 2xx：错误体原样透传，同时旁路记录
 	if resp.StatusCode >= 400 {
 		for k, vv := range resp.Header {
 			for _, v := range vv {
@@ -97,11 +106,19 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, up *config.Upst
 			}
 		}
 		w.WriteHeader(resp.StatusCode)
-		_, _ = io.Copy(w, resp.Body)
-		s.log(start, inboundFormat, d, *up, resp.StatusCode, isStream, nil)
+		src := io.Reader(resp.Body)
+		if rec != nil {
+			src = io.TeeReader(resp.Body, rec.UpstreamWriter())
+		}
+		_, _ = io.Copy(w, src)
+		if rec != nil {
+			rec.SetError(fmt.Errorf("upstream status %d", resp.StatusCode))
+			rec.SetStatus(resp.StatusCode)
+		}
+		s.log(start, inboundFormat, d, *up, resp.StatusCode, isStream, nil, rec)
 		return nil
 	}
-	// 同格式：透传（头部原样复制，流式/非流式都保持 Task 12 语义）
+	// 同格式：透传（头部原样复制；upstream 即 outbound，共用旁路）
 	if inboundFormat == up.Format {
 		for k, vv := range resp.Header {
 			for _, v := range vv {
@@ -109,36 +126,55 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, up *config.Upst
 			}
 		}
 		w.WriteHeader(resp.StatusCode)
+		src := io.Reader(resp.Body)
+		if rec != nil {
+			src = io.TeeReader(resp.Body, rec.UpstreamWriter())
+		}
 		var copyErr error
 		if isStream {
-			copyErr = s.copyStream(w, r, resp.Body)
+			copyErr = s.copyStream(w, r, src)
 		} else {
-			_, copyErr = io.Copy(w, resp.Body)
+			_, copyErr = io.Copy(w, src)
 		}
 		if errors.Is(copyErr, io.EOF) {
 			copyErr = nil // 流式自然结束，非错误
 		}
-		s.log(start, inboundFormat, d, *up, resp.StatusCode, isStream, copyErr)
+		if rec != nil {
+			rec.SetStatus(resp.StatusCode)
+		}
+		s.log(start, inboundFormat, d, *up, resp.StatusCode, isStream, copyErr, rec)
 		return nil
 	}
 	// 交叉格式：转换响应
 	if isStream {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(resp.StatusCode)
-		cerr := s.convertStream(r.Context(), w, resp.Body, inboundFormat, up.Format, up.Model)
+		cerr := s.convertStream(r.Context(), w, resp.Body, inboundFormat, up.Format, up.Model, rec)
 		// 成功与中途断流/转换失败都记日志：成功一行（status 200），
 		// 失败停止转发（已完成回写的部分保留），不伪造结束事件
-		s.log(start, inboundFormat, d, *up, resp.StatusCode, true, cerr)
+		if rec != nil {
+			rec.SetStatus(resp.StatusCode)
+		}
+		s.log(start, inboundFormat, d, *up, resp.StatusCode, true, cerr, rec)
 		return nil
 	}
 	data, err := io.ReadAll(io.LimitReader(resp.Body, maxBody+1))
 	if err != nil {
 		// 上游响应读取失败：上游来源错误 → 502
+		if rec != nil {
+			rec.SetError(err)
+		}
 		return fmt.Errorf("%w: read upstream response: %v", errUpstreamResponse, err)
 	}
 	if len(data) > maxBody {
 		// 上游响应超限 → 413
+		if rec != nil {
+			rec.SetError(fmt.Errorf("response exceeds %d bytes", maxBody))
+		}
 		return fmt.Errorf("%w: exceeds %d bytes", errResponseTooLarge, maxBody)
+	}
+	if rec != nil {
+		rec.SetUpstreamResponse(data)
 	}
 	var out any
 	if inboundFormat == "openai" { // 上游 Claude → 客户端 OpenAI
@@ -163,13 +199,19 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, up *config.Upst
 		}
 		out = o
 	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(resp.StatusCode)
-	if err := json.NewEncoder(w).Encode(out); err != nil {
-		s.log(start, inboundFormat, d, *up, resp.StatusCode, false, err)
+	outData, err := json.Marshal(out)
+	if err != nil {
+		s.log(start, inboundFormat, d, *up, resp.StatusCode, false, err, rec)
 		return nil
 	}
-	s.log(start, inboundFormat, d, *up, resp.StatusCode, false, nil)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(resp.StatusCode)
+	if rec != nil {
+		rec.SetOutboundResponse(outData)
+		rec.SetStatus(resp.StatusCode)
+	}
+	_, _ = w.Write(outData)
+	s.log(start, inboundFormat, d, *up, resp.StatusCode, false, nil, rec)
 	return nil
 }
 
@@ -180,8 +222,16 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, up *config.Upst
 //     正常结束（[DONE] 或 EOF）回写 Finish() 的结束帧；中途错误返回 error，不发任何结束帧。
 //
 // 流式读受 streamIdleTimeout 空闲超时约束：上游挂起时读返回超时错误，停止转发。
-func (s *Server) convertStream(ctx context.Context, w http.ResponseWriter, src io.Reader, inboundFormat, outboundFormat, model string) error {
+// rec 非 nil 时旁路捕获上游原始 SSE（UpstreamWriter）与转换后 SSE（OutboundWriter）。
+func (s *Server) convertStream(ctx context.Context, w http.ResponseWriter, src io.Reader, inboundFormat, outboundFormat, model string, rec *trafficlog.Recorder) error {
 	src = newTimeoutReader(ctx, src, streamIdleTimeout)
+	if rec != nil {
+		src = io.TeeReader(src, rec.UpstreamWriter())
+	}
+	ww := io.Writer(w)
+	if rec != nil {
+		ww = io.MultiWriter(w, rec.OutboundWriter())
+	}
 	if outboundFormat == "claude" {
 		// OpenAI 客户端收 Claude 流 → C2O
 		c := convert.NewC2OStream(model)
@@ -192,7 +242,7 @@ func (s *Server) convertStream(ctx context.Context, w http.ResponseWriter, src i
 			}
 			fl, _ := w.(http.Flusher)
 			for _, o := range outs {
-				_, _ = w.Write(o)
+				_, _ = ww.Write(o)
 			}
 			if fl != nil {
 				fl.Flush()
@@ -205,7 +255,7 @@ func (s *Server) convertStream(ctx context.Context, w http.ResponseWriter, src i
 				return fmt.Errorf("truncated claude stream: EOF without message_stop")
 			}
 			for _, o := range c.Close() {
-				_, _ = w.Write(o)
+				_, _ = ww.Write(o)
 			}
 			fl, _ := w.(http.Flusher)
 			if fl != nil {
@@ -242,7 +292,7 @@ func (s *Server) convertStream(ctx context.Context, w http.ResponseWriter, src i
 		}
 		fl, _ := w.(http.Flusher)
 		for _, o := range outs {
-			_, _ = w.Write(o)
+			_, _ = ww.Write(o)
 		}
 		if fl != nil {
 			fl.Flush()
@@ -251,7 +301,7 @@ func (s *Server) convertStream(ctx context.Context, w http.ResponseWriter, src i
 	// 仅收到 [DONE] 才发 message_stop；中途错误/裸 EOF 静默断流（由调用方记日志）
 	if doneSeen {
 		for _, o := range c.Finish() {
-			_, _ = w.Write(o)
+			_, _ = ww.Write(o)
 		}
 		fl, _ := w.(http.Flusher)
 		if fl != nil {

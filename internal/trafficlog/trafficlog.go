@@ -251,7 +251,11 @@ func (r *Recorder) SetError(err error) {
 		r.errMsg = err.Error() // 首次记录：内层错误不被外层覆盖
 	}
 }
-func (r *Recorder) SetStatus(status int) { r.status = status }
+func (r *Recorder) SetStatus(status int) {
+	if status != 0 && r.status == 0 {
+		r.status = status // 首次记录：上游透传的 4xx/5xx 不被外层 200 覆盖
+	}
+}
 
 // UpstreamWriter / OutboundWriter 供流式旁路累积（TeeReader/MultiWriter）。
 func (r *Recorder) UpstreamWriter() io.Writer { return r.upstreamResponse }
