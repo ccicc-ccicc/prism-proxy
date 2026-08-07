@@ -110,8 +110,13 @@ docker-build:
 	fi
 	@echo "构建完成: $(IMAGE_REF)"
 
-# 一键启动 Docker 容器服务（先停旧容器；打印将要执行的 docker run 命令）
+# 一键启动 Docker 容器服务：镜像不存在时先自动本地构建（单平台 --load）保证镜像存在；
+# 启动前停旧容器；打印将要执行的 docker run 命令
 docker-run:
+	@if ! docker image inspect $(IMAGE_REF) >/dev/null 2>&1; then \
+		echo "[提示] 镜像 $(IMAGE_REF) 不存在，先执行本地构建（make docker-build PLATFORM=linux/$(shell go env GOARCH)）..."; \
+		$(MAKE) docker-build PLATFORM=linux/$(shell go env GOARCH); \
+	fi
 	@docker rm -f $(CONTAINER_NAME) 2>/dev/null || true
 	@echo "启动 prism-proxy 容器，命令如下："
 	@echo "  docker run -d --name $(CONTAINER_NAME) -p $(LISTEN_PORT):8787 -v $(SETTINGS_DIR):/root/.prism-proxy $(IMAGE_REF)"
