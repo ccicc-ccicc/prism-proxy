@@ -8,11 +8,13 @@
 
 ```bash
 docker run -d --name prism-proxy \
+  --restart always \
   -p 8787:8787 \
   -v ~/.prism-proxy:/root/.prism-proxy \
   harbor.powerlaw.club/public/prism-proxy/prism-proxy:55fa21c
 ```
 
+- `--restart always`：容器退出/宿主机重启后自动拉起（常驻服务建议开启）。
 - `-p 8787:8787`：暴露代理端口，客户端统一访问 `http://127.0.0.1:8787`。
 - `-v ~/.prism-proxy:/root/.prism-proxy`：挂载配置目录。镜像内默认读取 `/root/.prism-proxy/settings.yaml`，宿主机目录不存在会自动创建；修改配置保存即生效（热加载），无需重启容器。
 
@@ -84,6 +86,11 @@ prism-proxy serve --config prism-proxy.yaml   # 指定配置
 server:
   listen: ":8787"        # 监听地址，默认 ":8787"
   auth_keys: []          # 空 = 关闭认证；如 ["sk-proxy-1"]
+
+logging:                 # 内容日志（traffic log），可选，默认关闭
+  enabled: false         # true = 每请求记录完整内容到 <dir>/traffic.log
+  dir: ~/.prism-proxy/logs
+  max_files: 3
 
 auto_switch_vision: true # false = 永不切换
 

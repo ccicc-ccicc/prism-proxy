@@ -119,8 +119,9 @@ docker-run:
 	fi
 	@docker rm -f $(CONTAINER_NAME) 2>/dev/null || true
 	@echo "启动 prism-proxy 容器，命令如下："
-	@echo "  docker run -d --name $(CONTAINER_NAME) -p $(LISTEN_PORT):8787 -v $(SETTINGS_DIR):/root/.prism-proxy $(IMAGE_REF)"
+	@echo "  docker run -d --name $(CONTAINER_NAME) --restart always -p $(LISTEN_PORT):8787 -v $(SETTINGS_DIR):/root/.prism-proxy $(IMAGE_REF)"
 	@docker run -d --name $(CONTAINER_NAME) \
+		--restart always \
 		-p $(LISTEN_PORT):8787 \
 		-v $(SETTINGS_DIR):/root/.prism-proxy \
 		$(IMAGE_REF)
