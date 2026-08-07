@@ -2,6 +2,45 @@
 
 本地 LLM API 代理：OpenAI <-> Claude 双协议网关。一个端口同时暴露 OpenAI `chat/completions` 与 Claude `messages` 两套协议，按路由规则转发到配置的上游，并自动完成请求/响应/流式的跨格式转换。
 
+## 快速开始（Docker 推荐）
+
+一条命令启动：
+
+```bash
+docker run -d --name prism-proxy \
+  -p 8787:8787 \
+  -v ~/.prism-proxy:/root/.prism-proxy \
+  harbor.powerlaw.club/public/prism-proxy/prism-proxy:55fa21c
+```
+
+- `-p 8787:8787`：暴露代理端口，客户端统一访问 `http://127.0.0.1:8787`。
+- `-v ~/.prism-proxy:/root/.prism-proxy`：挂载配置目录。镜像内默认读取 `/root/.prism-proxy/settings.yaml`，宿主机目录不存在会自动创建；修改配置保存即生效（热加载），无需重启容器。
+
+首次运行前准备配置：
+
+```bash
+mkdir -p ~/.prism-proxy
+cp prism-proxy.yaml.example ~/.prism-proxy/settings.yaml
+vim ~/.prism-proxy/settings.yaml   # 填入上游 baseurl / api_key
+```
+
+验证服务已就绪：
+
+```bash
+curl -s http://127.0.0.1:8787/v1/chat/completions \
+  -H "Content-Type: application/json" -H "Authorization: Bearer sk-test" \
+  -d '{"model":"ignored","messages":[{"role":"user","content":"hello"}]}'
+```
+
+查看日志 / 停止容器：
+
+```bash
+docker logs -f prism-proxy      # 实时日志
+docker stop prism-proxy && docker rm prism-proxy   # 停止并删除
+```
+
+> 也可以 `make docker-run` 自动构建并启动容器（见 [Makefile](Makefile)）；镜像名/标签通过 `IMAGE_NAME` / `IMAGE_TAG` 覆盖。
+
 ## 功能概述
 
 - **双协议网关**：同一监听端口同时接受 OpenAI 格式（`POST /v1/chat/completions`）与 Claude 格式（`POST /v1/messages`）请求；上游配置为 `openai` 或 `claude` 均可，四象限（同格式透传、O2C、C2O）自动转换，含流式（SSE）与工具调用（tool_calls / tool_use / tool_result）的完整映射。
@@ -15,7 +54,9 @@
 - **默认配置路径**：`serve` 缺省读取 `~/.prism-proxy/settings.yaml`，不存在则启动失败（提示旧默认迁移）；可用 `--config` 显式指定。
 - **内容日志（traffic log）**：`logging.enabled: true` 时，每请求一条 JSONL 记录客户端请求、出站请求、上游响应、出站响应四段完整内容（`api_key`/`key` 字段脱敏），写入 `~/.prism-proxy/logs/traffic.log`，100MB 轮转保留 `max_files` 个旧文件。
 
-## 安装构建
+## 本地构建（可选）
+
+生产部署推荐直接使用 Docker 镜像（见上方「快速开始」）；需要自行构建二进制时：
 
 需要 Go 1.25.5+（go.mod 声明的版本）。
 
@@ -37,7 +78,7 @@ prism-proxy serve --config prism-proxy.yaml   # 指定配置
 
 ## 配置说明
 
-完整字段注释见 [prism-proxy.yaml.example](prism-proxy.yaml.example)，复制为 `prism-proxy.yaml` 后修改。启动时配置校验失败会 **fail-fast** 直接报错退出（例如缺少 `main` 上游、`format` 非法、`auto_switch_vision: true` 但没有 `vision` 上游）。
+完整字段注释见 [prism-proxy.yaml.example](prism-proxy.yaml.example)，Docker 部署时复制为 `~/.prism-proxy/settings.yaml`（本地二进制可用 `--config` 指定任意路径）。启动时配置校验失败会 **fail-fast** 直接报错退出（例如缺少 `main` 上游、`format` 非法、`auto_switch_vision: true` 但没有 `vision` 上游）。
 
 ```yaml
 server:
