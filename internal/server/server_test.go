@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -13,8 +14,12 @@ import (
 	"testing"
 
 	"prism-proxy/internal/config"
+	"prism-proxy/internal/trafficlog"
 	"prism-proxy/internal/upstream"
 )
+
+// intPtr 返回指向 v 的指针，用于构造 LoggingConfig.MaxFiles（*int）。
+func intPtr(v int) *int { return &v }
 
 // failingWriter 模拟下游断开：Write 必然失败。
 type failingWriter struct {
@@ -555,5 +560,254 @@ func TestCopyStreamClientCancel(t *testing.T) {
 	err := srv.copyStream(&failingWriter{h: http.Header{}}, req, pr)
 	if err == nil || !errors.Is(err, context.Canceled) {
 		t.Fatalf("want context.Canceled, got %v", err)
+	}
+}
+
+func TestTrafficLog_NonStreamingFullCapture(t *testing.T) {
+	var buf bytes.Buffer
+	tl := trafficlog.NewWithWriter(&buf)
+	upstreamSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"id":"up-1","object":"chat.completion","model":"gpt-4o","choices":[]}`))
+	}))
+	defer upstreamSrv.Close()
+	cfg := &config.Config{
+		Logging: config.LoggingConfig{Enabled: true, Dir: t.TempDir(), MaxFiles: intPtr(3)},
+		Upstreams: map[string]config.UpstreamConfig{
+			"main": {BaseURL: upstreamSrv.URL + "/v1", APIKey: "sk", Format: "openai", Model: "gpt-4o"},
+		},
+	}
+	srv := NewWithConfig(cfg, upstream.NewClient(), slog.Default())
+	srv.SetTrafficLog(tl)
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+	resp, err := http.Post(ts.URL+"/v1/chat/completions", "application/json",
+		strings.NewReader(`{"messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	if resp.Header.Get("X-Request-Id") == "" {
+		t.Fatal("missing X-Request-Id header")
+	}
+	line := strings.TrimSpace(buf.String())
+	var e map[string]any
+	if err := json.Unmarshal([]byte(line), &e); err != nil {
+		t.Fatalf("parse entry: %v", err)
+	}
+	if e["request_id"] != resp.Header.Get("X-Request-Id") {
+		t.Fatalf("request_id mismatch: %v vs %v", e["request_id"], resp.Header.Get("X-Request-Id"))
+	}
+	if !strings.Contains(e["inbound_body"].(string), "hi") {
+		t.Fatalf("inbound_body: %v", e["inbound_body"])
+	}
+	if !strings.Contains(e["outbound_body"].(string), "gpt-4o") {
+		t.Fatalf("outbound_body: %v", e["outbound_body"])
+	}
+	if !strings.Contains(e["upstream_response"].(string), "up-1") {
+		t.Fatalf("upstream_response: %v", e["upstream_response"])
+	}
+	if e["outbound_response"].(string) != e["upstream_response"].(string) {
+		t.Fatalf("passthrough outbound should equal upstream: %v vs %v", e["outbound_response"], e["upstream_response"])
+	}
+	if e["status"] != float64(200) {
+		t.Fatalf("status: %v", e["status"])
+	}
+}
+
+func TestTrafficLog_DisabledNoCapture(t *testing.T) {
+	var buf bytes.Buffer
+	tl := trafficlog.NewWithWriter(&buf)
+	cfg := &config.Config{
+		Logging: config.LoggingConfig{Enabled: false, Dir: t.TempDir(), MaxFiles: intPtr(3)},
+		Upstreams: map[string]config.UpstreamConfig{
+			"main": {BaseURL: "http://127.0.0.1:1", APIKey: "sk", Format: "openai", Model: "m"},
+		},
+	}
+	srv := NewWithConfig(cfg, upstream.NewClient(), slog.Default())
+	srv.SetTrafficLog(tl)
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+	resp, err := http.Post(ts.URL+"/v1/chat/completions", "application/json",
+		strings.NewReader(`{"messages":[]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	if buf.Len() != 0 {
+		t.Fatalf("disabled should not log, got: %s", buf.String())
+	}
+}
+
+func TestTrafficLog_UpstreamErrorPassthroughRecorded(t *testing.T) {
+	var buf bytes.Buffer
+	tl := trafficlog.NewWithWriter(&buf)
+	upstreamSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(429)
+		w.Write([]byte(`{"error":{"message":"rate limited"}}`))
+	}))
+	defer upstreamSrv.Close()
+	cfg := &config.Config{
+		Logging: config.LoggingConfig{Enabled: true, Dir: t.TempDir(), MaxFiles: intPtr(3)},
+		Upstreams: map[string]config.UpstreamConfig{
+			"main": {BaseURL: upstreamSrv.URL + "/v1", APIKey: "sk", Format: "openai", Model: "m"},
+		},
+	}
+	srv := NewWithConfig(cfg, upstream.NewClient(), slog.Default())
+	srv.SetTrafficLog(tl)
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+	resp, err := http.Post(ts.URL+"/v1/chat/completions", "application/json",
+		strings.NewReader(`{"messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	var e map[string]any
+	if err := json.Unmarshal([]byte(strings.TrimSpace(buf.String())), &e); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if e["status"] != float64(429) {
+		t.Fatalf("status: %v", e["status"])
+	}
+	if !strings.Contains(e["error"].(string), "upstream status 429") {
+		t.Fatalf("error: %v", e["error"])
+	}
+	if !strings.Contains(e["upstream_response"].(string), "rate limited") {
+		t.Fatalf("upstream_response: %v", e["upstream_response"])
+	}
+}
+
+func TestTrafficLog_CrossFormatNonStreaming(t *testing.T) {
+	var buf bytes.Buffer
+	tl := trafficlog.NewWithWriter(&buf)
+	upstreamSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 读取请求体确认被转换为 claude 格式
+		body, _ := io.ReadAll(r.Body)
+		var req map[string]any
+		_ = json.Unmarshal(body, &req)
+		if req["max_tokens"] == nil {
+			t.Errorf("outbound body not claude format: %s", body)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"id":"msg_1","type":"message","role":"assistant","model":"claude-3","content":[{"type":"text","text":"converted"}],"stop_reason":"end_turn","usage":{"input_tokens":5,"output_tokens":3}}`))
+	}))
+	defer upstreamSrv.Close()
+	cfg := &config.Config{
+		Logging: config.LoggingConfig{Enabled: true, Dir: t.TempDir(), MaxFiles: intPtr(3)},
+		Upstreams: map[string]config.UpstreamConfig{
+			"main": {BaseURL: upstreamSrv.URL + "/v1", APIKey: "sk", Format: "claude", Model: "claude-3"},
+		},
+	}
+	srv := NewWithConfig(cfg, upstream.NewClient(), slog.Default())
+	srv.SetTrafficLog(tl)
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+	resp, err := http.Post(ts.URL+"/v1/chat/completions", "application/json",
+		strings.NewReader(`{"messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	var e map[string]any
+	if err := json.Unmarshal([]byte(strings.TrimSpace(buf.String())), &e); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if e["outbound"].(string) != "claude" {
+		t.Fatalf("outbound: %v", e["outbound"])
+	}
+	if !strings.Contains(e["outbound_body"].(string), "max_tokens") {
+		t.Fatalf("outbound_body not converted: %v", e["outbound_body"])
+	}
+	if !strings.Contains(e["upstream_response"].(string), "msg_1") {
+		t.Fatalf("upstream_response: %v", e["upstream_response"])
+	}
+	// 转换后为 openai 格式，与上游 claude 响应不同
+	if e["outbound_response"].(string) == e["upstream_response"].(string) {
+		t.Fatalf("cross-format outbound should differ from upstream: %v", e["outbound_response"])
+	}
+	if !strings.Contains(e["outbound_response"].(string), "choices") {
+		t.Fatalf("outbound_response not converted to openai: %v", e["outbound_response"])
+	}
+}
+
+func TestTrafficLog_PassthroughStreaming(t *testing.T) {
+	var buf bytes.Buffer
+	tl := trafficlog.NewWithWriter(&buf)
+	upstreamSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"b\"}}]}\n\ndata: [DONE]\n\n"))
+	}))
+	defer upstreamSrv.Close()
+	cfg := &config.Config{
+		Logging: config.LoggingConfig{Enabled: true, Dir: t.TempDir(), MaxFiles: intPtr(3)},
+		Upstreams: map[string]config.UpstreamConfig{
+			"main": {BaseURL: upstreamSrv.URL + "/v1", APIKey: "sk", Format: "openai", Model: "gpt-4o"},
+		},
+	}
+	srv := NewWithConfig(cfg, upstream.NewClient(), slog.Default())
+	srv.SetTrafficLog(tl)
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+	resp, err := http.Post(ts.URL+"/v1/chat/completions", "application/json",
+		strings.NewReader(`{"stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	var e map[string]any
+	if err := json.Unmarshal([]byte(strings.TrimSpace(buf.String())), &e); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if e["stream"] != true {
+		t.Fatalf("stream: %v", e["stream"])
+	}
+	if !strings.Contains(e["upstream_response"].(string), "[DONE]") {
+		t.Fatalf("upstream stream incomplete: %v", e["upstream_response"])
+	}
+	if e["outbound_response"].(string) != e["upstream_response"].(string) {
+		t.Fatalf("passthrough outbound should equal upstream")
+	}
+}
+
+// Important: 交叉格式流式截断（上游 SSE 无 [DONE]）→ convertStream 返回
+// 截断错误，traffic 条目 error 字段必须非空。
+func TestTrafficLog_TruncatedStreamErrorRecorded(t *testing.T) {
+	var buf bytes.Buffer
+	tl := trafficlog.NewWithWriter(&buf)
+	upstreamSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n")) // 无 [DONE]
+	}))
+	defer upstreamSrv.Close()
+	cfg := &config.Config{
+		Logging: config.LoggingConfig{Enabled: true, Dir: t.TempDir(), MaxFiles: intPtr(3)},
+		Upstreams: map[string]config.UpstreamConfig{
+			"main": {BaseURL: upstreamSrv.URL + "/v1", APIKey: "sk", Format: "openai", Model: "gpt-4o"},
+		},
+	}
+	srv := NewWithConfig(cfg, upstream.NewClient(), slog.Default())
+	srv.SetTrafficLog(tl)
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+	resp, err := http.Post(ts.URL+"/v1/messages", "application/json",
+		strings.NewReader(`{"max_tokens":64,"stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	var e map[string]any
+	if err := json.Unmarshal([]byte(strings.TrimSpace(buf.String())), &e); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	es, _ := e["error"].(string)
+	if !strings.Contains(es, "truncated") {
+		t.Fatalf("want truncated stream error, got: %q", es)
 	}
 }

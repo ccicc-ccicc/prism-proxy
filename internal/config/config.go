@@ -3,6 +3,8 @@ package config
 import (
 	"fmt"
 	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -11,7 +13,26 @@ import (
 type Config struct {
 	Server           ServerConfig              `yaml:"server"`
 	AutoSwitchVision bool                      `yaml:"auto_switch_vision"`
+	Logging          LoggingConfig             `yaml:"logging"`
 	Upstreams        map[string]UpstreamConfig `yaml:",inline"`
+}
+
+// LoggingConfig 内容日志配置（traffic log）。
+type LoggingConfig struct {
+	Enabled bool   `yaml:"enabled"` // 默认 false
+	Dir     string `yaml:"dir"`     // 默认 ~/.prism-proxy/logs，支持 ~ 前缀
+	// MaxFiles 轮转保留旧文件数。*int 区分"未设置"与"显式 0"：
+	// nil = 未设置（默认 3）；0 = lumberjack 保留全部旧文件（不删除）。
+	MaxFiles *int `yaml:"max_files"`
+}
+
+// MaxBackups 返回 lumberjack MaxBackups 值：显式 0 时返回 0（保留全部旧文件）；
+// 未设置（nil）时返回默认 3。
+func (c *LoggingConfig) MaxBackups() int {
+	if c.MaxFiles == nil {
+		return 3
+	}
+	return *c.MaxFiles
 }
 
 type ServerConfig struct {
@@ -25,6 +46,9 @@ type UpstreamConfig struct {
 	Format  string        `yaml:"format"`
 	Model   string        `yaml:"model"`
 	Timeout time.Duration `yaml:"timeout"`
+	// Auth 出站认证头，空 = 按 format 默认（openai → Bearer，claude → x-api-key）；
+	// 显式 "bearer" 或 "x-api-key" 覆盖。网关类上游（如 AIGW）常用 Bearer 认证。
+	Auth string `yaml:"auth"`
 }
 
 const defaultTimeout = 120 * time.Second
@@ -49,6 +73,14 @@ func (c *Config) applyDefaults() {
 	if c.Server.Listen == "" {
 		c.Server.Listen = ":8787"
 	}
+	if c.Logging.Dir == "" {
+		c.Logging.Dir = "~/.prism-proxy/logs"
+	}
+	if c.Logging.MaxFiles == nil {
+		def := 3
+		c.Logging.MaxFiles = &def
+	}
+	c.Logging.Dir = expandHome(c.Logging.Dir)
 	for name := range c.Upstreams {
 		u := c.Upstreams[name]
 		if u.Timeout == 0 {
@@ -56,6 +88,22 @@ func (c *Config) applyDefaults() {
 		}
 		c.Upstreams[name] = u
 	}
+}
+
+// expandHome 展开 ~ 前缀为用户主目录；非 ~ 开头原样返回。
+func expandHome(path string) string {
+	if path == "~" {
+		if h, err := os.UserHomeDir(); err == nil {
+			return h
+		}
+		return path
+	}
+	if strings.HasPrefix(path, "~/") {
+		if h, err := os.UserHomeDir(); err == nil {
+			return filepath.Join(h, path[2:])
+		}
+	}
+	return path
 }
 
 func (c *Config) Validate() error {
@@ -90,6 +138,9 @@ func validateUpstream(name string, u UpstreamConfig) error {
 	}
 	if u.Model == "" {
 		return fmt.Errorf("config: upstream %q: model is required", name)
+	}
+	if u.Auth != "" && u.Auth != "bearer" && u.Auth != "x-api-key" {
+		return fmt.Errorf("config: upstream %q: auth must be bearer or x-api-key, got %q", name, u.Auth)
 	}
 	return nil
 }

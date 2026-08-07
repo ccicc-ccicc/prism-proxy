@@ -10,6 +10,28 @@ import (
 // 原子映射：OpenAI Chat Completions ↔ Claude Messages 的消息/工具/图片/ID 转换。
 // ClaudeBlock 的 ToolUseID 字段定义在 claude.go（json tag: tool_use_id）。
 
+// SystemString 将 MessagesRequest.System（string 或文本块数组）规整为纯文本；
+// 非 text 块/空值忽略，块间 \n 连接。
+func SystemString(system any) string {
+	switch s := system.(type) {
+	case string:
+		return s
+	case []any:
+		var parts []string
+		for _, p := range s {
+			m, ok := p.(map[string]any)
+			if !ok || m["type"] != "text" {
+				continue
+			}
+			if text, ok := m["text"].(string); ok && text != "" {
+				parts = append(parts, text)
+			}
+		}
+		return strings.Join(parts, "\n")
+	}
+	return ""
+}
+
 // OpenAIMessagesToClaude 将 OpenAI 消息序列转为 Claude 消息序列：
 //   - system 消息合并进 system 返回值（\n 连接）
 //   - assistant 的 tool_calls → tool_use blocks（arguments JSON 串 parse 为对象，非法 → {} + slog 警告）
@@ -124,11 +146,18 @@ func convertOpenAIContent(c any) any {
 //   - emit 顺序：tool_result（role=tool）消息必须先于同一消息内的 user 文本
 func ClaudeMessagesToOpenAI(msgs []ClaudeMessage, system string) ([]ChatMessage, error) {
 	var out []ChatMessage
-	if system != "" {
-		out = append(out, ChatMessage{Role: "system", Content: system})
-	}
+	sys := system
 	for _, m := range msgs {
 		switch m.Role {
+		case "system":
+			// Claude Code v2 把系统提示也放入 messages（role=system），
+			// 与顶层 system 字段合并，统一置于 messages[0]。
+			if t := systemText(m.Content); t != "" {
+				if sys != "" {
+					sys += "\n"
+				}
+				sys += t
+			}
 		case "user", "assistant":
 			if s, ok := m.Content.(string); ok {
 				// content 可能为字符串（简写）
@@ -203,7 +232,30 @@ func ClaudeMessagesToOpenAI(msgs []ClaudeMessage, system string) ([]ChatMessage,
 			return nil, fmt.Errorf("unsupported claude role %q", m.Role)
 		}
 	}
+	if sys != "" {
+		out = append([]ChatMessage{{Role: "system", Content: sys}}, out...)
+	}
 	return out, nil
+}
+
+// systemText 提取 role=system 消息的文本：string 直返，块数组取 text 块 \n 连接。
+func systemText(c any) string {
+	if s, ok := c.(string); ok {
+		return s
+	}
+	blocks, ok := contentBlocks(c)
+	if !ok {
+		return ""
+	}
+	var parts []string
+	for _, bm := range blocks {
+		if bm["type"] == "text" {
+			if t, ok := bm["text"].(string); ok && t != "" {
+				parts = append(parts, t)
+			}
+		}
+	}
+	return strings.Join(parts, "\n")
 }
 
 // contentBlocks 将 Claude content 归一化为 map 切片，兼容 []ClaudeBlock 与 []any 两种形状。

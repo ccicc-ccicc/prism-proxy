@@ -68,6 +68,8 @@ main:                        # 主上游：必填
   api_key: "sk-xxx"
   format: openai             # openai | claude
   model: "gpt-4o"            # 每个上游单模型
+  auth: ""                   # 出站认证头：空 = 按 format 默认（openai→Bearer，claude→x-api-key）；
+                             # bearer / x-api-key 显式覆盖（网关类上游如 AIGW 需要）
   timeout: 120s              # 上游超时，可选，默认 120s
 
 vision:                      # 可选；多模态上游，与主上游完全解耦
@@ -132,12 +134,13 @@ vision:                      # 可选；多模态上游，与主上游完全解�
 | Claude → OpenAI | C2O 转换器（组合原子映射函数） |
 
 出站认证头按上游 format 替换：OpenAI 上游 `Authorization: Bearer <key>`；Claude 上游 `x-api-key: <key>` + `anthropic-version: 2023-06-01`。
+上游 `auth` 字段可显式覆盖：`auth: bearer` / `auth: x-api-key`（空 = 按 format 默认）。网关类上游（如网易 AIGW）暴露 `/v1/messages` 形态但要求 Bearer 认证，需配 `auth: bearer`。
 
 ### 请求映射（原子函数，双向复用）
 
 | 语义 | OpenAI | Claude |
 |---|---|---|
-| 系统提示 | `messages[role=system]` | 顶层 `system` 字段（多 system 合并） |
+| 系统提示 | `messages[role=system]` | 顶层 `system` 字段（多 system 合并；入站兼容 string 与内容块数组两种形态，C2O 时归一为文本；Claude Code v2 的 `messages[role=system]` 消息同样合并进 system） |
 | 用户/助手 | `messages` | `messages` |
 | 工具结果 | `role=tool` | user 消息 + `tool_result` block |
 | 工具定义 | `tools[].function{name,description,parameters}` | `tools[].input_schema` |

@@ -35,7 +35,7 @@ func OpenAIRequestToClaude(req *ChatCompletionRequest, model string) (*MessagesR
 }
 
 func ClaudeRequestToOpenAI(req *MessagesRequest, model string) (*ChatCompletionRequest, error) {
-	msgs, err := ClaudeMessagesToOpenAI(req.Messages, req.System)
+	msgs, err := ClaudeMessagesToOpenAI(req.Messages, SystemString(req.System))
 	if err != nil {
 		return nil, err
 	}
