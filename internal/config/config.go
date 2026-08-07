@@ -3,6 +3,8 @@ package config
 import (
 	"fmt"
 	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -11,7 +13,15 @@ import (
 type Config struct {
 	Server           ServerConfig              `yaml:"server"`
 	AutoSwitchVision bool                      `yaml:"auto_switch_vision"`
+	Logging          LoggingConfig             `yaml:"logging"`
 	Upstreams        map[string]UpstreamConfig `yaml:",inline"`
+}
+
+// LoggingConfig 内容日志配置（traffic log）。
+type LoggingConfig struct {
+	Enabled  bool   `yaml:"enabled"`   // 默认 false
+	Dir      string `yaml:"dir"`       // 默认 ~/.prism-proxy/logs，支持 ~ 前缀
+	MaxFiles int    `yaml:"max_files"` // 轮转保留旧文件数；0 = 不删除
 }
 
 type ServerConfig struct {
@@ -52,6 +62,13 @@ func (c *Config) applyDefaults() {
 	if c.Server.Listen == "" {
 		c.Server.Listen = ":8787"
 	}
+	if c.Logging.Dir == "" {
+		c.Logging.Dir = "~/.prism-proxy/logs"
+	}
+	if c.Logging.MaxFiles == 0 {
+		c.Logging.MaxFiles = 3
+	}
+	c.Logging.Dir = expandHome(c.Logging.Dir)
 	for name := range c.Upstreams {
 		u := c.Upstreams[name]
 		if u.Timeout == 0 {
@@ -59,6 +76,22 @@ func (c *Config) applyDefaults() {
 		}
 		c.Upstreams[name] = u
 	}
+}
+
+// expandHome 展开 ~ 前缀为用户主目录；非 ~ 开头原样返回。
+func expandHome(path string) string {
+	if path == "~" {
+		if h, err := os.UserHomeDir(); err == nil {
+			return h
+		}
+		return path
+	}
+	if strings.HasPrefix(path, "~/") {
+		if h, err := os.UserHomeDir(); err == nil {
+			return filepath.Join(h, path[2:])
+		}
+	}
+	return path
 }
 
 func (c *Config) Validate() error {
