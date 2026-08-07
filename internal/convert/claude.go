@@ -14,8 +14,11 @@ const (
 )
 
 type MessagesRequest struct {
-	Model         string          `json:"model"`
-	System        string          `json:"system,omitempty"`
+	Model string `json:"model"`
+	// System 兼容 Anthropic 两种形态：string（旧版）或文本块数组
+	// （新版 Claude Code 发送 [{"type":"text","text":"..."}]）。统一
+	// 处理走 SystemString()。
+	System        any             `json:"system,omitempty"`
 	Messages      []ClaudeMessage `json:"messages"`
 	Tools         []ClaudeTool    `json:"tools,omitempty"`
 	Stream        bool            `json:"stream,omitempty"`

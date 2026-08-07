@@ -92,6 +92,11 @@ func TestValidateUpstreamFieldRules(t *testing.T) {
 			cfg:     &Config{Upstreams: map[string]UpstreamConfig{"main": {BaseURL: "b", APIKey: "k", Format: "openai"}}},
 			wantErr: "model",
 		},
+		{
+			name:    "invalid auth",
+			cfg:     &Config{Upstreams: map[string]UpstreamConfig{"main": {BaseURL: "b", APIKey: "k", Format: "openai", Model: "m", Auth: "magic"}}},
+			wantErr: "auth must be bearer or x-api-key",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -103,5 +108,65 @@ func TestValidateUpstreamFieldRules(t *testing.T) {
 				t.Fatalf("Validate() error = %q, want substring %q", err, tt.wantErr)
 			}
 		})
+	}
+}
+
+func TestLogging_DefaultsAndParse(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "settings.yaml")
+	if err := os.WriteFile(path, []byte("main:\n  baseurl: http://x/v1\n  api_key: sk\n  format: openai\n  model: m\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Logging.Enabled {
+		t.Error("logging.enabled want default false")
+	}
+	home, _ := os.UserHomeDir()
+	wantDir := filepath.Join(home, ".prism-proxy", "logs")
+	if cfg.Logging.Dir != wantDir {
+		t.Errorf("logging.dir=%q want %q", cfg.Logging.Dir, wantDir)
+	}
+	if cfg.Logging.MaxBackups() != 3 {
+		t.Errorf("logging.max_files=%d want 3", cfg.Logging.MaxBackups())
+	}
+}
+
+func TestLogging_ParseExplicit(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "settings.yaml")
+	if err := os.WriteFile(path, []byte("main:\n  baseurl: http://x/v1\n  api_key: sk\n  format: openai\n  model: m\nlogging:\n  enabled: true\n  dir: ~/custom/logs\n  max_files: 5\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Logging.Enabled {
+		t.Error("logging.enabled want true")
+	}
+	home, _ := os.UserHomeDir()
+	if want := filepath.Join(home, "custom", "logs"); cfg.Logging.Dir != want {
+		t.Errorf("dir=%q want %q", cfg.Logging.Dir, want)
+	}
+	if cfg.Logging.MaxBackups() != 5 {
+		t.Errorf("max_files=%d want 5", cfg.Logging.MaxBackups())
+	}
+}
+
+func TestLogging_MaxFilesZeroMeansKeepAll(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "settings.yaml")
+	if err := os.WriteFile(path, []byte("main:\n  baseurl: http://x/v1\n  api_key: sk\n  format: openai\n  model: m\nlogging:\n  max_files: 0\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Logging.MaxBackups() != 0 {
+		t.Fatalf("max_backups=%d want 0 (keep all)", cfg.Logging.MaxBackups())
 	}
 }

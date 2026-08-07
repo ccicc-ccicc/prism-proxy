@@ -20,6 +20,17 @@ func TestClaudeRequestUnmarshal(t *testing.T) {
 	}
 }
 
+func TestClaudeRequestUnmarshal_SystemArray(t *testing.T) {
+	data := []byte(`{"model":"claude-3","max_tokens":1024,"system":[{"type":"text","text":"a"},{"type":"text","text":"b"}],"messages":[{"role":"user","content":"hi"}]}`)
+	var req MessagesRequest
+	if err := json.Unmarshal(data, &req); err != nil {
+		t.Fatal(err)
+	}
+	if got := SystemString(req.System); got != "a\nb" {
+		t.Fatalf("system: %q", got)
+	}
+}
+
 func TestClaudeStreamEventUnmarshal(t *testing.T) {
 	data := []byte(`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}`)
 	var ev StreamEvent

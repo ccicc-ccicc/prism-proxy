@@ -61,6 +61,28 @@ func TestDo_ClaudeFormatHeaders(t *testing.T) {
 	}
 }
 
+func TestDo_ClaudeFormatAuthOverrideBearer(t *testing.T) {
+	var gotAuth, gotKey, gotVer string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		gotKey = r.Header.Get("x-api-key")
+		gotVer = r.Header.Get("anthropic-version")
+		w.WriteHeader(200)
+		w.Write([]byte(`{"id":"msg_x"}`))
+	}))
+	defer srv.Close()
+	c := NewClient()
+	u := &config.UpstreamConfig{BaseURL: srv.URL + "/v1", APIKey: "sk-2", Format: "claude", Model: "m", Auth: "bearer"}
+	resp, err := c.Do(context.Background(), u, []byte(`{"model":"m"}`), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if gotAuth != "Bearer sk-2" || gotKey != "" || gotVer != "2023-06-01" {
+		t.Fatalf("headers: auth=%q key=%q ver=%q", gotAuth, gotKey, gotVer)
+	}
+}
+
 func TestDo_ErrorPassthrough(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(429)

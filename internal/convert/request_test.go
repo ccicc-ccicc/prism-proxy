@@ -49,3 +49,19 @@ func TestClaudeRequestToOpenAI(t *testing.T) {
 		t.Fatalf("tools: %+v", out.Tools)
 	}
 }
+
+func TestClaudeRequestToOpenAI_SystemArray(t *testing.T) {
+	req := &MessagesRequest{
+		Model:     "claude-3",
+		System:    []any{map[string]any{"type": "text", "text": "a"}, map[string]any{"type": "text", "text": "b"}},
+		MaxTokens: 1024,
+		Messages:  []ClaudeMessage{{Role: "user", Content: "hi"}},
+	}
+	out, err := ClaudeRequestToOpenAI(req, "gpt-4o")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Messages) != 2 || out.Messages[0].Role != "system" || out.Messages[0].Content != "a\nb" {
+		t.Fatalf("messages: %+v", out.Messages)
+	}
+}
