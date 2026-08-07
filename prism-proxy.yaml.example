@@ -1,0 +1,28 @@
+# prism-proxy 配置示例（复制为 prism-proxy.yaml 后按需修改）
+# 启动: prism-proxy serve --config prism-proxy.yaml
+
+server:
+  listen: ":8787"            # 监听地址；默认 ":8787"
+  auth_keys: []              # 认证密钥列表；空 = 关闭认证（任意 key 均可访问）
+                             # 例: ["sk-proxy-1"]；OpenAI 客户端走 Authorization: Bearer <key>，
+                             #   Claude 客户端走 x-api-key: <key>
+
+auto_switch_vision: true     # 带图请求自动切换到 vision 上游；false = 永不切换
+                             # true 时必须有 vision 上游，否则启动 fail-fast 报错
+
+# 主上游：默认转发目标（所有文本/非切换请求）
+main:
+  baseurl: "https://api.openai.com/v1"   # 上游 base URL（不含 /chat/completions 或 /messages）
+  api_key: "sk-xxxx"                     # 上游 API key
+  format: openai                         # 上游协议: openai | claude
+  model: "gpt-4o"                        # 转发时强制改写为的模型名（忽略入站请求的 model）
+  timeout: 120s                          # 连接+响应头超时（Go duration 字符串，如 "30s"）；默认 120s
+
+# vision 上游（可选）: auto_switch_vision: true 时必填（否则启动 panic/fail-fast）
+# 带图请求（OpenAI image_url / Claude image 或 tool_result 内嵌图片）会被切到该上游
+vision:
+  baseurl: "https://api.anthropic.com/v1"
+  api_key: "sk-ant-xxxx"
+  format: claude                         # 独立上游常用 Claude（如 claude-3-5-sonnet），也可配 openai
+  model: "claude-3-5-sonnet"
+  timeout: 120s
