@@ -807,7 +807,7 @@ func TestTrafficLog_StreamingFullCapture(t *testing.T) {
 	}))
 	defer upstreamSrv.Close()
 	cfg := &config.Config{
-		Logging: config.LoggingConfig{Enabled: true, Dir: t.TempDir(), MaxFiles: 3},
+		Logging: config.LoggingConfig{Enabled: true, Dir: t.TempDir(), MaxFiles: intPtr(3)},
 		Upstreams: map[string]config.UpstreamConfig{
 			"main": {BaseURL: upstreamSrv.URL + "/v1", APIKey: "sk", Format: "openai", Model: "gpt-4o"},
 		},

@@ -19,9 +19,20 @@ type Config struct {
 
 // LoggingConfig 内容日志配置（traffic log）。
 type LoggingConfig struct {
-	Enabled  bool   `yaml:"enabled"`   // 默认 false
-	Dir      string `yaml:"dir"`       // 默认 ~/.prism-proxy/logs，支持 ~ 前缀
-	MaxFiles int    `yaml:"max_files"` // 轮转保留旧文件数；0 = 不删除
+	Enabled bool   `yaml:"enabled"` // 默认 false
+	Dir     string `yaml:"dir"`     // 默认 ~/.prism-proxy/logs，支持 ~ 前缀
+	// MaxFiles 轮转保留旧文件数。*int 区分"未设置"与"显式 0"：
+	// nil = 未设置（默认 3）；0 = lumberjack 保留全部旧文件（不删除）。
+	MaxFiles *int `yaml:"max_files"`
+}
+
+// MaxBackups 返回 lumberjack MaxBackups 值：显式 0 时返回 0（保留全部旧文件）；
+// 未设置（nil）时返回默认 3。
+func (c *LoggingConfig) MaxBackups() int {
+	if c.MaxFiles == nil {
+		return 3
+	}
+	return *c.MaxFiles
 }
 
 type ServerConfig struct {
@@ -65,8 +76,9 @@ func (c *Config) applyDefaults() {
 	if c.Logging.Dir == "" {
 		c.Logging.Dir = "~/.prism-proxy/logs"
 	}
-	if c.Logging.MaxFiles == 0 {
-		c.Logging.MaxFiles = 3
+	if c.Logging.MaxFiles == nil {
+		def := 3
+		c.Logging.MaxFiles = &def
 	}
 	c.Logging.Dir = expandHome(c.Logging.Dir)
 	for name := range c.Upstreams {

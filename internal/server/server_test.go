@@ -18,6 +18,9 @@ import (
 	"prism-proxy/internal/upstream"
 )
 
+// intPtr 返回指向 v 的指针，用于构造 LoggingConfig.MaxFiles（*int）。
+func intPtr(v int) *int { return &v }
+
 // failingWriter 模拟下游断开：Write 必然失败。
 type failingWriter struct {
 	h http.Header
@@ -569,7 +572,7 @@ func TestTrafficLog_NonStreamingFullCapture(t *testing.T) {
 	}))
 	defer upstreamSrv.Close()
 	cfg := &config.Config{
-		Logging: config.LoggingConfig{Enabled: true, Dir: t.TempDir(), MaxFiles: 3},
+		Logging: config.LoggingConfig{Enabled: true, Dir: t.TempDir(), MaxFiles: intPtr(3)},
 		Upstreams: map[string]config.UpstreamConfig{
 			"main": {BaseURL: upstreamSrv.URL + "/v1", APIKey: "sk", Format: "openai", Model: "gpt-4o"},
 		},
@@ -617,7 +620,7 @@ func TestTrafficLog_DisabledNoCapture(t *testing.T) {
 	var buf bytes.Buffer
 	tl := trafficlog.NewWithWriter(&buf)
 	cfg := &config.Config{
-		Logging: config.LoggingConfig{Enabled: false, Dir: t.TempDir(), MaxFiles: 3},
+		Logging: config.LoggingConfig{Enabled: false, Dir: t.TempDir(), MaxFiles: intPtr(3)},
 		Upstreams: map[string]config.UpstreamConfig{
 			"main": {BaseURL: "http://127.0.0.1:1", APIKey: "sk", Format: "openai", Model: "m"},
 		},
@@ -647,7 +650,7 @@ func TestTrafficLog_UpstreamErrorPassthroughRecorded(t *testing.T) {
 	}))
 	defer upstreamSrv.Close()
 	cfg := &config.Config{
-		Logging: config.LoggingConfig{Enabled: true, Dir: t.TempDir(), MaxFiles: 3},
+		Logging: config.LoggingConfig{Enabled: true, Dir: t.TempDir(), MaxFiles: intPtr(3)},
 		Upstreams: map[string]config.UpstreamConfig{
 			"main": {BaseURL: upstreamSrv.URL + "/v1", APIKey: "sk", Format: "openai", Model: "m"},
 		},
@@ -694,7 +697,7 @@ func TestTrafficLog_CrossFormatNonStreaming(t *testing.T) {
 	}))
 	defer upstreamSrv.Close()
 	cfg := &config.Config{
-		Logging: config.LoggingConfig{Enabled: true, Dir: t.TempDir(), MaxFiles: 3},
+		Logging: config.LoggingConfig{Enabled: true, Dir: t.TempDir(), MaxFiles: intPtr(3)},
 		Upstreams: map[string]config.UpstreamConfig{
 			"main": {BaseURL: upstreamSrv.URL + "/v1", APIKey: "sk", Format: "claude", Model: "claude-3"},
 		},
@@ -741,7 +744,7 @@ func TestTrafficLog_PassthroughStreaming(t *testing.T) {
 	}))
 	defer upstreamSrv.Close()
 	cfg := &config.Config{
-		Logging: config.LoggingConfig{Enabled: true, Dir: t.TempDir(), MaxFiles: 3},
+		Logging: config.LoggingConfig{Enabled: true, Dir: t.TempDir(), MaxFiles: intPtr(3)},
 		Upstreams: map[string]config.UpstreamConfig{
 			"main": {BaseURL: upstreamSrv.URL + "/v1", APIKey: "sk", Format: "openai", Model: "gpt-4o"},
 		},
@@ -783,7 +786,7 @@ func TestTrafficLog_TruncatedStreamErrorRecorded(t *testing.T) {
 	}))
 	defer upstreamSrv.Close()
 	cfg := &config.Config{
-		Logging: config.LoggingConfig{Enabled: true, Dir: t.TempDir(), MaxFiles: 3},
+		Logging: config.LoggingConfig{Enabled: true, Dir: t.TempDir(), MaxFiles: intPtr(3)},
 		Upstreams: map[string]config.UpstreamConfig{
 			"main": {BaseURL: upstreamSrv.URL + "/v1", APIKey: "sk", Format: "openai", Model: "gpt-4o"},
 		},

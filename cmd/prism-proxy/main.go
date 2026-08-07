@@ -84,7 +84,7 @@ func serveCmd() *cobra.Command {
 			// 内容日志：启动时 enabled 则构造 TrafficLog（dir/max_files 变更需重启）
 			var traffic *trafficlog.TrafficLog
 			if cfg := watcher.Get(); cfg.Logging.Enabled {
-				traffic, err = trafficlog.New(cfg.Logging.Dir, cfg.Logging.MaxFiles)
+				traffic, err = trafficlog.New(cfg.Logging.Dir, cfg.Logging.MaxBackups())
 				if err != nil {
 					return fmt.Errorf("init traffic log: %w", err)
 				}

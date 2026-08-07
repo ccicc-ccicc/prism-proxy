@@ -65,7 +65,7 @@ vision:                  # 可选；auto_switch_vision: true 时必填（否则�
 `logging` 段（可选，默认关闭）：
 - `enabled`：内容日志开关，默认 `false`。`enabled` 支持热切换（运行中改配置自动生效）；`dir`/`max_files` 变更需重启。
 - `dir`：日志目录，默认 `~/.prism-proxy/logs`（支持 `~` 前缀展开；若为相对路径按当前工作目录）。
-- `max_files`：轮转保留的旧文件数，默认 `3`（`traffic.log`、`traffic.log.1`、...）。
+- `max_files`：轮转保留的旧文件数，默认 `3`（`traffic.log`、`traffic.log.1`、...）；`0` = 不删除旧文件（保留全部）。
 - 轮转阈值固定为 lumberjack 默认 100MB。
 
 ## 路由规则

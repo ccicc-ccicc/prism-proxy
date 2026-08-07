@@ -11,7 +11,7 @@ server:
 logging:
   enabled: false                 # 内容日志开关；true 时记录每请求完整四段内容
   dir: ~/.prism-proxy/logs       # 日志目录；默认 ~/.prism-proxy/logs（~ 会展开）
-  max_files: 3                   # 轮转保留旧文件数（traffic.log.1, .2, ...）；0 = 不删除
+  max_files: 3                   # 轮转保留旧文件数（traffic.log.1, .2, ...）；0 = 不删除旧文件（保留全部）
                                  # 轮转阈值 lumberjack 默认 100MB；dir/max_files 变更需重启
 
 auto_switch_vision: true     # 带图请求自动切换到 vision 上游；false = 永不切换
