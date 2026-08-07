@@ -1,6 +1,9 @@
 package trafficlog
 
 import (
+	"bytes"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -42,5 +45,58 @@ func TestRedact_ArrayAndNormalFields(t *testing.T) {
 	}
 	if !strings.Contains(s, "keep me") {
 		t.Fatalf("normal content lost: %s", s)
+	}
+}
+
+func TestSegBuffer_InMemory(t *testing.T) {
+	s := newSegBufferMax(t.TempDir(), "seg", 1024)
+	defer s.Close()
+	if _, err := s.Write([]byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+	if s.String() != "hello" {
+		t.Fatalf("got %q", s.String())
+	}
+	if s.file != nil {
+		t.Fatal("want in-memory, got file")
+	}
+}
+
+func TestSegBuffer_SpillToDisk(t *testing.T) {
+	dir := t.TempDir()
+	s := newSegBufferMax(dir, "seg", 8)
+	defer s.Close()
+	big := bytes.Repeat([]byte("a"), 100)
+	if _, err := s.Write(big); err != nil {
+		t.Fatal(err)
+	}
+	if s.file == nil {
+		t.Fatal("want spilled to file")
+	}
+	if s.String() != string(big) {
+		t.Fatalf("content mismatch: len %d want %d", len(s.String()), len(big))
+	}
+	entries, _ := os.ReadDir(dir)
+	found := false
+	for _, e := range entries {
+		if filepath.Ext(e.Name()) == ".part" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("no .part temp file")
+	}
+}
+
+func TestSegBuffer_CloseRemovesFile(t *testing.T) {
+	dir := t.TempDir()
+	s := newSegBufferMax(dir, "seg", 8)
+	_, _ = s.Write(bytes.Repeat([]byte("b"), 100))
+	name := s.file.Name()
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(name); !os.IsNotExist(err) {
+		t.Fatalf("temp file not removed: %v", err)
 	}
 }
