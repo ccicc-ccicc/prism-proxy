@@ -110,12 +110,13 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, up *config.Upst
 		if rec != nil {
 			src = io.TeeReader(resp.Body, rec.UpstreamWriter())
 		}
-		_, _ = io.Copy(w, src)
+		_, copyErr := io.Copy(w, src)
 		if rec != nil {
 			rec.SetError(fmt.Errorf("upstream status %d", resp.StatusCode))
 			rec.SetStatus(resp.StatusCode)
 		}
-		s.log(start, inboundFormat, d, *up, resp.StatusCode, isStream, nil, rec)
+		// copyErr 为 nil 时传 nil，不覆盖 rec 已记录的 "upstream status N" 错误
+		s.log(start, inboundFormat, d, *up, resp.StatusCode, isStream, copyErr, rec)
 		return nil
 	}
 	// 同格式：透传（头部原样复制；upstream 即 outbound，共用旁路）
@@ -124,6 +125,11 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, up *config.Upst
 			for _, v := range vv {
 				w.Header().Add(k, v)
 			}
+		}
+		// 流式透传不沿用上游 Content-Length：SSE 应以 chunked 分块发送，
+		// 否则客户端按定长提前读完，handler 的延迟落盘（内容日志）尚未执行
+		if isStream {
+			w.Header().Del("Content-Length")
 		}
 		w.WriteHeader(resp.StatusCode)
 		src := io.Reader(resp.Body)
