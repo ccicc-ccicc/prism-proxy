@@ -2,9 +2,11 @@ package trafficlog
 
 import (
 	"bytes"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -98,5 +100,96 @@ func TestSegBuffer_CloseRemovesFile(t *testing.T) {
 	}
 	if _, err := os.Stat(name); !os.IsNotExist(err) {
 		t.Fatalf("temp file not removed: %v", err)
+	}
+}
+
+func TestTrafficLog_WriteEntry(t *testing.T) {
+	var buf bytes.Buffer
+	tl := NewWithWriter(&buf)
+	e := Entry{
+		TS: "2026-08-07T10:00:00+08:00", RequestID: "rid1", Inbound: "openai",
+		Upstream: "main", Outbound: "claude", Model: "m", Stream: false,
+		Status: 200, DurationMS: 123, InboundBody: `{"a":1}`,
+		UpstreamResponse: `{"b":2}`, Error: "",
+	}
+	if err := tl.WriteEntry(e); err != nil {
+		t.Fatal(err)
+	}
+	lines := bytes.Split(bytes.TrimRight(buf.Bytes(), "\n"), []byte("\n"))
+	if len(lines) != 1 {
+		t.Fatalf("want 1 line, got %d", len(lines))
+	}
+	var got map[string]any
+	if err := json.Unmarshal(lines[0], &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["request_id"] != "rid1" || got["status"] != float64(200) {
+		t.Fatalf("entry: %s", lines[0])
+	}
+	if got["inbound_body"] != `{"a":1}` {
+		t.Fatalf("inbound_body: %v", got["inbound_body"])
+	}
+}
+
+func TestTrafficLog_ConcurrentWrites(t *testing.T) {
+	var buf bytes.Buffer
+	tl := NewWithWriter(&buf)
+	var wg sync.WaitGroup
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			_ = tl.WriteEntry(Entry{RequestID: "r" + string(rune('0'+n)), TS: "t"})
+		}(i % 10)
+	}
+	wg.Wait()
+	lines := bytes.Split(bytes.TrimRight(buf.Bytes(), "\n"), []byte("\n"))
+	if len(lines) != 50 {
+		t.Fatalf("want 50 lines, got %d", len(lines))
+	}
+}
+
+func TestTrafficLog_NewCreatesDir(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "nested", "logs")
+	tl, err := New(dir, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tl.Close()
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatalf("dir not created: %v", err)
+	}
+}
+
+func TestSegBuffer_SpillThenContinue(t *testing.T) {
+	dir := t.TempDir()
+	s := newSegBufferMax(dir, "seg", 8)
+	defer s.Close()
+	big := bytes.Repeat([]byte("a"), 100)
+	if _, err := s.Write(big); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Write([]byte("tail")); err != nil {
+		t.Fatal(err)
+	}
+	want := string(big) + "tail"
+	if s.String() != want {
+		t.Fatalf("spill then write: got len %d want %d", len(s.String()), len(want))
+	}
+}
+
+func TestSegBuffer_SpillFailKeepsData(t *testing.T) {
+	s := newSegBufferMax(filepath.Join(t.TempDir(), "nope"), "seg", 8)
+	defer s.Close()
+	_, err := s.Write(bytes.Repeat([]byte("c"), 100))
+	if err == nil {
+		t.Fatal("want spill error")
+	}
+	if s.file != nil {
+		t.Fatal("file should stay nil on failure")
+	}
+	// 数据保留在内存，换到可写目录后仍可成功落盘
+	if s.buf.Len() != 100 {
+		t.Fatalf("buf len=%d want 100", s.buf.Len())
 	}
 }

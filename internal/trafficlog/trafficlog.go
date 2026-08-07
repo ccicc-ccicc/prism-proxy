@@ -8,6 +8,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
+	"sync"
+
+	"gopkg.in/natefinch/lumberjack.v2"
 )
 
 // Redact 将 JSON body 中 api_key / key 字段的字符串值替换为 sk-***。
@@ -73,9 +77,13 @@ func (s *segBuffer) Write(p []byte) (int, error) {
 			s.size += int64(n)
 			return n, nil
 		}
+		// 先写入内存缓冲再尝试落盘：落盘失败时数据保留在 buf，不丢失
+		n, _ := s.buf.Write(p)
+		s.size += int64(n)
 		if err := s.spill(); err != nil {
-			return 0, err
+			return n, err
 		}
+		return n, nil
 	}
 	n, err := s.file.Write(p)
 	s.size += int64(n)
@@ -126,4 +134,72 @@ func (s *segBuffer) Close() error {
 	}
 	s.file = nil
 	return err
+}
+
+// Entry 单条内容日志（JSONL，每请求一条）。
+type Entry struct {
+	TS               string `json:"ts"`
+	RequestID        string `json:"request_id"`
+	Inbound          string `json:"inbound"`
+	Upstream         string `json:"upstream"`
+	Outbound         string `json:"outbound"`
+	Model            string `json:"model"`
+	Stream           bool   `json:"stream"`
+	Status           int    `json:"status"`
+	DurationMS       int64  `json:"duration_ms"`
+	InboundBody      string `json:"inbound_body"`
+	OutboundBody     string `json:"outbound_body"`
+	UpstreamResponse string `json:"upstream_response"`
+	OutboundResponse string `json:"outbound_response"`
+	Error            string `json:"error"`
+}
+
+// TrafficLog 内容日志 writer：JSONL 追加写，lumberjack 按大小轮转。
+// 并发安全（内部 mutex）。
+type TrafficLog struct {
+	w   io.Writer
+	dir string
+	mu  sync.Mutex
+}
+
+// New 创建 TrafficLog：创建 dir 目录，写 <dir>/traffic.log，100MB 轮转。
+func New(dir string, maxFiles int) (*TrafficLog, error) {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, fmt.Errorf("traffic log dir: %w", err)
+	}
+	lj := &lumberjack.Logger{
+		Filename:   filepath.Join(dir, "traffic.log"),
+		MaxSize:    100,      // MB，lumberjack 默认值
+		MaxBackups: maxFiles, // 保留旧文件数
+	}
+	return &TrafficLog{w: lj, dir: dir}, nil
+}
+
+// NewWithWriter 测试注入：自定义 writer（如 bytes.Buffer）。
+func NewWithWriter(w io.Writer) *TrafficLog {
+	return &TrafficLog{w: w}
+}
+
+// Dir 返回日志目录（Recorder 临时文件目录复用）。
+func (t *TrafficLog) Dir() string { return t.dir }
+
+// WriteEntry 写一条 JSONL。
+func (t *TrafficLog) WriteEntry(e Entry) error {
+	data, err := json.Marshal(e)
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	_, err = t.w.Write(data)
+	return err
+}
+
+// Close 关闭底层 writer（lumberjack）。
+func (t *TrafficLog) Close() error {
+	if c, ok := t.w.(io.Closer); ok {
+		return c.Close()
+	}
+	return nil
 }
