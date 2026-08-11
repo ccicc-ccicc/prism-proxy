@@ -14,10 +14,11 @@ const (
 )
 
 type Decision struct {
-	Upstream     string
-	Model        string
-	VisionSwitch bool
-	HasImage     bool // 入站请求是否含图（spec §7：命中但不切换时日志标记 image_detected）
+	Upstream        string
+	Model           string
+	VisionSwitch    bool
+	HasImage        bool // 入站请求末尾用户侧 run 是否含图（spec §7：命中但不切换时日志标记 image_detected）
+	ImagesSanitized bool // 历史图片已被替换为文本标记（仅走 main 且 auto_switch_vision 时可能）
 }
 
 // Decide 按 spec §4 两条规则决策，忽略请求模型名。
