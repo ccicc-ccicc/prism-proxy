@@ -152,7 +152,20 @@ func LatestUserRunHasImage(format string, body []byte) (bool, error) {
 	if format == "openai" {
 		userRoles["tool"] = true
 	}
-	for i := len(msgs) - 1; i >= 0; i-- {
+	// 序列以 assistant 结尾时，run 为其前最后一段连续用户侧消息：先跳过尾部非用户侧消息
+	end := len(msgs) - 1
+	for ; end >= 0; end-- {
+		var msg map[string]json.RawMessage
+		if err := json.Unmarshal(msgs[end], &msg); err != nil {
+			return false, fmt.Errorf("parse %s request: %w", format, err)
+		}
+		var role string
+		_ = json.Unmarshal(msg["role"], &role)
+		if userRoles[role] {
+			break
+		}
+	}
+	for i := end; i >= 0; i-- {
 		var msg map[string]json.RawMessage
 		if err := json.Unmarshal(msgs[i], &msg); err != nil {
 			return false, fmt.Errorf("parse %s request: %w", format, err)
@@ -160,7 +173,7 @@ func LatestUserRunHasImage(format string, body []byte) (bool, error) {
 		var role string
 		_ = json.Unmarshal(msg["role"], &role)
 		if !userRoles[role] {
-			break // assistant 打断 run
+			break // 中间的 assistant 打断 run
 		}
 		content := msg["content"]
 		if len(content) > 0 {
@@ -378,19 +391,31 @@ func SanitizeHistoryImages(format string, body []byte) ([]byte, bool, error) {
 	if !ok {
 		return nil, false, fmt.Errorf("parse %s request: missing messages", format)
 	}
-	runStart := len(msgs) // run 为空
+	runStart := 0 // run 为空 → 不遍历（no-op）
 	userRoles := map[string]bool{"user": true}
 	if format == "openai" {
 		userRoles["tool"] = true
 	}
-	for i := len(msgs) - 1; i >= 0; i-- {
+	// 与 LatestUserRunHasImage 同一语义：先跳过尾部非用户侧消息，再向前扫 run（中间 assistant 打断）
+	end := len(msgs) - 1
+	for ; end >= 0; end-- {
+		m, ok := msgs[end].(map[string]any)
+		if !ok {
+			break
+		}
+		role, _ := m["role"].(string)
+		if userRoles[role] {
+			break
+		}
+	}
+	for i := end; i >= 0; i-- {
 		m, ok := msgs[i].(map[string]any)
 		if !ok {
 			break
 		}
 		role, _ := m["role"].(string)
 		if !userRoles[role] {
-			break
+			break // 中间的 assistant 打断 run
 		}
 		runStart = i
 	}
