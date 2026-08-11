@@ -60,8 +60,8 @@ vision:                  # 可选；auto_switch_vision: true 时必填（否则�
 
 ## 路由规则
 
-1. **带图请求 + `auto_switch_vision: true` + 已配置 vision 上游** → 转发 `vision` 上游，模型改写为 `vision.model`。
-2. **其余所有请求**（文本、开关关闭、无 vision 上游） → 转发 `main` 上游，模型改写为 `main.model`。
+1. **最新轮次带图请求**（末尾连续 user/tool 消息段，含 `tool_result` 内嵌）+ `auto_switch_vision: true` + 已配置 vision 上游 → 转发 `vision` 上游，模型改写为 `vision.model`。
+2. **其余所有请求**（最新轮次无图/纯文本、开关关闭、无 vision 上游） → 转发 `main` 上游，模型改写为 `main.model`。历史带图且最新轮次无图时同样走 `main`，历史图片脱敏为文本标记（`[image: analyzed in previous reply]` / `[image omitted]`）后转发。
 
 请求里的 `model` 字段被忽略（配置优先）。上游超时默认为 120s；流式响应整体时长不限，按块控制空闲超时（60s）。请求体上限 50MB，`n > 1` 的请求返回 400。
 
@@ -125,6 +125,7 @@ msg="config reloaded" path=prism-proxy.yaml
 | `model` | 改写后的模型名 |
 | `vision_switch` | 是否触发图片切换（bool） |
 | `image_detected` | 检测到图片但未切换（开关关/无 vision 上游）时为 `true` |
+| `images_sanitized` | 是否对历史图片做了脱敏替换（true/false） |
 | `stream` | 是否流式（bool） |
 | `status` | 回写客户端的 HTTP 状态码 |
 | `duration_ms` | 请求耗时（毫秒） |
