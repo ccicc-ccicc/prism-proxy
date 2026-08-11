@@ -219,9 +219,11 @@ func TestSanitize_ClaudeImageBlockReplaced(t *testing.T) {
 }
 
 func TestSanitize_ClaudeNoAssistantText(t *testing.T) {
-	// 含图消息后无含文本 assistant 消息 → omitted 标记
+	// 含图消息后无含文本 assistant 消息 → omitted 标记。
+	// 注意：含图消息必须被 assistant 打断（run 边界外），否则两条连续 user 会整体算入 run。
 	body := []byte(`{"model":"x","messages":[
 		{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}]},
+		{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"search","input":{}}]},
 		{"role":"user","content":"继续"}
 	]}`)
 	out, changed, err := SanitizeHistoryImages("claude", body)

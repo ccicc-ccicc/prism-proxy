@@ -85,7 +85,7 @@ func LatestUserRunHasImage(format string, body []byte) (bool, error) {
 	return false, nil
 }
 
-// SanitizeHistoryImages 将 run（最后一条用户侧消息）之前历史消息中的图片块替换为文本标记，
+// SanitizeHistoryImages 将 run 之前历史消息中的图片块替换为文本标记，
 // assistant 解析文本原位保留（语义由历史中相邻的 assistant 回复承载）。
 // 必须 map 基遍历：typed 往返会丢弃 cache_control/metadata 等未知字段。
 // run 为空或无图 → no-op（返回原 body 字节、sanitized=false）。
@@ -98,12 +98,12 @@ func SanitizeHistoryImages(format string, body []byte) ([]byte, bool, error) {
 	if !ok {
 		return nil, false, fmt.Errorf("parse %s request: missing messages", format)
 	}
+	runStart := 0 // run 为空 → 不遍历（no-op）
 	userRoles := map[string]bool{"user": true}
 	if format == "openai" {
 		userRoles["tool"] = true
 	}
-	// run = 最后一条用户侧消息：先跳过尾部非用户侧消息；run 为空（end<0）→ 不遍历（no-op）。
-	// 连续用户侧段内更早的消息视为历史（走 main 时一并脱敏）。
+	// 与 LatestUserRunHasImage 同一语义：先跳过尾部非用户侧消息，再向前扫 run（中间 assistant 打断）
 	end := len(msgs) - 1
 	for ; end >= 0; end-- {
 		m, ok := msgs[end].(map[string]any)
@@ -115,8 +115,19 @@ func SanitizeHistoryImages(format string, body []byte) ([]byte, bool, error) {
 			break
 		}
 	}
+	for i := end; i >= 0; i-- {
+		m, ok := msgs[i].(map[string]any)
+		if !ok {
+			break
+		}
+		role, _ := m["role"].(string)
+		if !userRoles[role] {
+			break // 中间的 assistant 打断 run
+		}
+		runStart = i
+	}
 	changed := false
-	for i := 0; i < end; i++ {
+	for i := 0; i < runStart; i++ {
 		m, ok := msgs[i].(map[string]any)
 		if !ok {
 			continue
