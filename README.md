@@ -46,7 +46,8 @@ docker stop prism-proxy && docker rm prism-proxy   # 停止并删除
 ## 功能概述
 
 - **双协议网关**：同一监听端口同时接受 OpenAI 格式（`POST /v1/chat/completions`）与 Claude 格式（`POST /v1/messages`）请求；上游配置为 `openai` 或 `claude` 均可，四象限（同格式透传、O2C、C2O）自动转换，含流式（SSE）与工具调用（tool_calls / tool_use / tool_result）的完整映射。
-- **图片自动切换**：入站请求带图（OpenAI `image_url` / Claude `image`，含 `tool_result` 内嵌）且 `auto_switch_vision: true` 时，自动转发到独立的 `vision` 上游（通常是 Claude），文本请求零变化地走 `main`。
+- **图片自动切换**：入站请求**最新轮次**（末尾连续 user/tool 消息段）带图（OpenAI `image_url` / Claude `image`，含 `tool_result` 内嵌）且 `auto_switch_vision: true` 时，自动转发到独立的 `vision` 上游（通常是 Claude），文本请求零变化地走 `main`。
+- **历史图片脱敏**：`auto_switch_vision: true` 且走 `main` 时，历史消息中的图片块替换为短文本标记（`[image: analyzed in previous reply]` / `[image omitted]`），模型解析文本在历史中原位保留——纯文本轮次不再触发 vision 切换，也不向纯文本模型发送图片。`auto_switch_vision: false` 时完全原样转发。
 - **独立 vision 上游**：`main` 与 `vision` 可配不同格式/模型/密钥，互不影响。
 - **模型改写**：转发时强制改写为配置的模型名，忽略入站请求里的 `model` 字段（`vision_switch` 后走 vision 配置的模型）。
 - **配置热加载**：修改 `prism-proxy.yaml` 无需重启，自动生效（fsnotify，支持编辑器原子写）。
@@ -118,8 +119,8 @@ vision:                  # 可选；auto_switch_vision: true 时必填（否则�
 
 ## 路由规则
 
-1. **带图请求 + `auto_switch_vision: true` + 已配置 vision 上游** → 转发 `vision` 上游，模型改写为 `vision.model`。
-2. **其余所有请求**（文本、开关关闭、无 vision 上游） → 转发 `main` 上游，模型改写为 `main.model`。
+1. **最新轮次带图请求**（末尾连续 user/tool 消息段，含 `tool_result` 内嵌）+ `auto_switch_vision: true` + 已配置 vision 上游 → 转发 `vision` 上游，模型改写为 `vision.model`。
+2. **其余所有请求**（最新轮次无图/纯文本、开关关闭、无 vision 上游） → 转发 `main` 上游，模型改写为 `main.model`。历史带图且最新轮次无图时同样走 `main`，历史图片脱敏为文本标记（`[image: analyzed in previous reply]` / `[image omitted]`）后转发。
 
 请求里的 `model` 字段被忽略（配置优先）。上游超时默认为 120s；流式响应整体时长不限，按块控制空闲超时（60s）。请求体上限 50MB，`n > 1` 的请求返回 400。
 
@@ -185,6 +186,7 @@ msg="config reloaded" path=prism-proxy.yaml
 | `model` | 改写后的模型名 |
 | `vision_switch` | 是否触发图片切换（bool） |
 | `image_detected` | 检测到图片但未切换（开关关/无 vision 上游）时为 `true` |
+| `images_sanitized` | 是否对历史图片做了脱敏替换（true/false） |
 | `stream` | 是否流式（bool） |
 | `status` | 回写客户端的 HTTP 状态码 |
 | `duration_ms` | 请求耗时（毫秒） |

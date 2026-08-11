@@ -305,3 +305,83 @@ func TestMatrix_OutboundStreamFlag(t *testing.T) {
 		})
 	}
 }
+
+// TestSanitize_HistoryImageToMain：auto_switch=true + 历史含图 + 最新纯文本 →
+// main 收到无图 body（历史图替换为标记），且 model 改写与脱敏共存。
+func TestSanitize_HistoryImageToMain(t *testing.T) {
+	upstreamSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if strings.Contains(string(body), "image_url") || strings.Contains(string(body), `"image"`) {
+			t.Fatalf("image not sanitized: %s", body)
+		}
+		if !strings.Contains(string(body), "[image: analyzed") {
+			t.Fatalf("marker missing: %s", body)
+		}
+		var m map[string]any
+		_ = json.Unmarshal(body, &m)
+		if m["model"] != "m" {
+			t.Fatalf("model not rewritten: %v", m["model"])
+		}
+		w.Write([]byte(openaiMockResponse("m", "ok")))
+	}))
+	defer upstreamSrv.Close()
+	cfg := &config.Config{
+		AutoSwitchVision: true,
+		Upstreams: map[string]config.UpstreamConfig{
+			"main": {BaseURL: upstreamSrv.URL + "/v1", APIKey: "sk", Format: "openai", Model: "m"},
+		},
+	}
+	srv := NewWithConfig(cfg, upstream.NewClient(), slog.Default())
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+	req := `{"model":"ignored","messages":[
+		{"role":"user","content":[{"type":"text","text":"看图"},{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}]},
+		{"role":"assistant","content":"图上有个按钮"},
+		{"role":"user","content":"点哪里"}
+	]}`
+	resp, err := http.Post(ts.URL+"/v1/chat/completions", "application/json", strings.NewReader(req))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status: %d body: %s", resp.StatusCode, body)
+	}
+}
+
+// TestSanitize_NewImageGoesVision：最新 run 含图 → vision 收到原样 body（不脱敏）。
+func TestSanitize_NewImageGoesVision(t *testing.T) {
+	upstreamSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if !strings.Contains(string(body), `"type":"image"`) || !strings.Contains(string(body), "source") {
+			// 注：vision 上游为 claude 格式，O2C 转换后 image_url 块变为
+			// {"type":"image","source":{...}}——按测试意图断言图片内容存续。
+			t.Fatalf("image lost on vision relay: %s", body)
+		}
+		w.Write([]byte(claudeMockResponse("claude-3", "ok")))
+	}))
+	defer upstreamSrv.Close()
+	cfg := &config.Config{
+		AutoSwitchVision: true,
+		Upstreams: map[string]config.UpstreamConfig{
+			"main":   {BaseURL: upstreamSrv.URL + "/v1", APIKey: "sk", Format: "openai", Model: "gpt-4o"},
+			"vision": {BaseURL: upstreamSrv.URL + "/v1", APIKey: "sk", Format: "claude", Model: "claude-3"},
+		},
+	}
+	srv := NewWithConfig(cfg, upstream.NewClient(), slog.Default())
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+	req := `{"model":"ignored","messages":[
+		{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}]}
+	]}`
+	resp, err := http.Post(ts.URL+"/v1/chat/completions", "application/json", strings.NewReader(req))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status: %d body: %s", resp.StatusCode, body)
+	}
+}

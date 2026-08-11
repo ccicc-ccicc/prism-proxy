@@ -115,11 +115,26 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, format, http.StatusBadRequest, "invalid request: "+err.Error(), rec)
 		return
 	}
+	if decision.Upstream == "main" && cfg.AutoSwitchVision {
+		var sanitized bool
+		body, sanitized, err = route.SanitizeHistoryImages(format, body)
+		if err != nil {
+			if rec != nil {
+				rec.SetError(err)
+				rec.SetStatus(http.StatusBadRequest)
+			}
+			writeError(w, format, http.StatusBadRequest, "invalid request: "+err.Error(), rec)
+			return
+		}
+		decision.ImagesSanitized = sanitized
+	}
 	if rec != nil {
 		up := cfg.Upstreams[decision.Upstream]
 		rec.SetDecision(decision.Upstream, up.Format, decision.Model)
 	}
 	if err := s.relay(w, r, cfg, format, body, decision, rec); err != nil {
+		// 请求转换失败回 400；上游来源失败回 502（读取/解析上游响应）；
+		// 上游响应超限回 413。错误信封一律用入站格式（writeError）。
 		status := http.StatusBadRequest
 		switch {
 		case errors.Is(err, errResponseTooLarge):
@@ -264,6 +279,9 @@ func (s *Server) log(start time.Time, format string, d route.Decision, up config
 	if d.HasImage && !d.VisionSwitch {
 		// spec §7：检测到图片但未切换（开关关/无 vision 上游）时记录
 		attrs = append(attrs, "image_detected", true)
+	}
+	if d.ImagesSanitized {
+		attrs = append(attrs, "images_sanitized", true)
 	}
 	if err != nil {
 		attrs = append(attrs, "error", err.Error())
