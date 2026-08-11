@@ -101,6 +101,8 @@ main:                    # 主上游（必填）
   model: "gpt-4o"
   auth: ""               # 出站认证头：空 = 按 format 默认（openai→Bearer，claude→x-api-key）；
                          # 显式 bearer / x-api-key 覆盖。网关类上游（AIGW）claude 形态却要求 Bearer，用 auth: bearer
+  thinking_compat: false # thinking 模式兼容（可选）：true 时给缺 thinking 块的 assistant(tool_use)
+                         # 轮次补空 thinking 块，适配 AIGW/DeepSeek 类上游（Anthropic 官方 API 不适用，默认 false）
   timeout: 120s          # 连接+响应头超时（Go duration 字符串），默认 120s
 
 vision:                  # 可选；auto_switch_vision: true 时必填（否则启动失败）

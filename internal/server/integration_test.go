@@ -305,3 +305,193 @@ func TestMatrix_OutboundStreamFlag(t *testing.T) {
 		})
 	}
 }
+
+// TestSanitize_HistoryImageToMain：auto_switch=true + 历史含图 + 最新纯文本 →
+// main 收到无图 body（历史图替换为标记），且 model 改写与脱敏共存。
+func TestSanitize_HistoryImageToMain(t *testing.T) {
+	upstreamSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if strings.Contains(string(body), "image_url") || strings.Contains(string(body), `"image"`) {
+			t.Fatalf("image not sanitized: %s", body)
+		}
+		if !strings.Contains(string(body), "[image: analyzed") {
+			t.Fatalf("marker missing: %s", body)
+		}
+		var m map[string]any
+		_ = json.Unmarshal(body, &m)
+		if m["model"] != "m" {
+			t.Fatalf("model not rewritten: %v", m["model"])
+		}
+		w.Write([]byte(openaiMockResponse("m", "ok")))
+	}))
+	defer upstreamSrv.Close()
+	cfg := &config.Config{
+		AutoSwitchVision: true,
+		Upstreams: map[string]config.UpstreamConfig{
+			"main": {BaseURL: upstreamSrv.URL + "/v1", APIKey: "sk", Format: "openai", Model: "m"},
+		},
+	}
+	srv := NewWithConfig(cfg, upstream.NewClient(), slog.Default())
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+	req := `{"model":"ignored","messages":[
+		{"role":"user","content":[{"type":"text","text":"看图"},{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}]},
+		{"role":"assistant","content":"图上有个按钮"},
+		{"role":"user","content":"点哪里"}
+	]}`
+	resp, err := http.Post(ts.URL+"/v1/chat/completions", "application/json", strings.NewReader(req))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status: %d body: %s", resp.StatusCode, body)
+	}
+}
+
+// TestSanitize_NewImageGoesVision：最新 run 含图 → vision 收到原样 body（不脱敏）。
+func TestSanitize_NewImageGoesVision(t *testing.T) {
+	upstreamSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if !strings.Contains(string(body), `"type":"image"`) || !strings.Contains(string(body), "source") {
+			// 注：vision 上游为 claude 格式，O2C 转换后 image_url 块变为
+			// {"type":"image","source":{...}}——按测试意图断言图片内容存续。
+			t.Fatalf("image lost on vision relay: %s", body)
+		}
+		w.Write([]byte(claudeMockResponse("claude-3", "ok")))
+	}))
+	defer upstreamSrv.Close()
+	cfg := &config.Config{
+		AutoSwitchVision: true,
+		Upstreams: map[string]config.UpstreamConfig{
+			"main":   {BaseURL: upstreamSrv.URL + "/v1", APIKey: "sk", Format: "openai", Model: "gpt-4o"},
+			"vision": {BaseURL: upstreamSrv.URL + "/v1", APIKey: "sk", Format: "claude", Model: "claude-3"},
+		},
+	}
+	srv := NewWithConfig(cfg, upstream.NewClient(), slog.Default())
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+	req := `{"model":"ignored","messages":[
+		{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}]}
+	]}`
+	resp, err := http.Post(ts.URL+"/v1/chat/completions", "application/json", strings.NewReader(req))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status: %d body: %s", resp.StatusCode, body)
+	}
+}
+
+// thinkingCompatReq 是 thinking 模式下的多轮工具调用请求：
+// assistant(tool_use) 轮次缺 thinking 块（AIGW/DeepSeek 类上游会拒绝）。
+const thinkingCompatReq = `{"model":"x","thinking":{"type":"adaptive"},"messages":[
+	{"role":"user","content":"hi"},
+	{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"bash","input":{}}]},
+	{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"out"}]}
+]}`
+
+// TestThinkingCompat_PatchApplied：thinking_compat=true 时，同格式 claude 透传
+// 给缺 thinking 块的 assistant(tool_use) 轮次补空 thinking 块（content[0]），
+// 原 tool_use 保留在 content[1]，模型仍改写为配置值。
+func TestThinkingCompat_PatchApplied(t *testing.T) {
+	upstreamSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req map[string]any
+		if err := json.Unmarshal(body, &req); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if req["model"] != "m" {
+			t.Fatalf("model not rewritten: %v", req["model"])
+		}
+		msgs, _ := req["messages"].([]any)
+		assistant, ok := msgs[1].(map[string]any)
+		if !ok || assistant["role"] != "assistant" {
+			t.Fatalf("messages[1] not assistant: %s", body)
+		}
+		content, _ := assistant["content"].([]any)
+		if len(content) != 2 {
+			t.Fatalf("assistant content length: %d (want 2): %s", len(content), body)
+		}
+		first, ok := content[0].(map[string]any)
+		if !ok || first["type"] != "thinking" {
+			t.Fatalf("assistant(tool_use) missing thinking block: %s", body)
+		}
+		if th, _ := first["thinking"].(string); th != "" {
+			t.Fatalf("thinking block not empty: %s", body)
+		}
+		second, ok := content[1].(map[string]any)
+		if !ok || second["type"] != "tool_use" {
+			t.Fatalf("tool_use not preserved: %s", body)
+		}
+		w.Write([]byte(claudeMockResponse("m", "ok")))
+	}))
+	defer upstreamSrv.Close()
+	cfg := &config.Config{
+		Upstreams: map[string]config.UpstreamConfig{
+			"main": {BaseURL: upstreamSrv.URL + "/v1", APIKey: "sk", Format: "claude", Model: "m", ThinkingCompat: true},
+		},
+	}
+	srv := NewWithConfig(cfg, upstream.NewClient(), slog.Default())
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+	resp, err := http.Post(ts.URL+"/v1/messages", "application/json", strings.NewReader(thinkingCompatReq))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status: %d body: %s", resp.StatusCode, body)
+	}
+}
+
+// TestThinkingCompat_DisabledPassthrough：thinking_compat 默认 false →
+// body 原样透传，assistant(tool_use) 不被补 thinking 块（content 保持单个 tool_use）。
+func TestThinkingCompat_DisabledPassthrough(t *testing.T) {
+	upstreamSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req map[string]any
+		if err := json.Unmarshal(body, &req); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		msgs, _ := req["messages"].([]any)
+		assistant, ok := msgs[1].(map[string]any)
+		if !ok || assistant["role"] != "assistant" {
+			t.Fatalf("messages[1] not assistant: %s", body)
+		}
+		content, _ := assistant["content"].([]any)
+		if len(content) != 1 {
+			t.Fatalf("assistant content modified (want 1 block): %s", body)
+		}
+		first, ok := content[0].(map[string]any)
+		if !ok || first["type"] == "thinking" {
+			t.Fatalf("unexpected thinking block: %s", body)
+		}
+		if first["type"] != "tool_use" {
+			t.Fatalf("tool_use not passthrough: %s", body)
+		}
+		w.Write([]byte(claudeMockResponse("m", "ok")))
+	}))
+	defer upstreamSrv.Close()
+	cfg := &config.Config{
+		Upstreams: map[string]config.UpstreamConfig{
+			"main": {BaseURL: upstreamSrv.URL + "/v1", APIKey: "sk", Format: "claude", Model: "m"},
+		},
+	}
+	srv := NewWithConfig(cfg, upstream.NewClient(), slog.Default())
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+	resp, err := http.Post(ts.URL+"/v1/messages", "application/json", strings.NewReader(thinkingCompatReq))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status: %d body: %s", resp.StatusCode, body)
+	}
+}
