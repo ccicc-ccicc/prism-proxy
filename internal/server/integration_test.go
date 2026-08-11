@@ -385,3 +385,113 @@ func TestSanitize_NewImageGoesVision(t *testing.T) {
 		t.Fatalf("status: %d body: %s", resp.StatusCode, body)
 	}
 }
+
+// thinkingCompatReq 是 thinking 模式下的多轮工具调用请求：
+// assistant(tool_use) 轮次缺 thinking 块（AIGW/DeepSeek 类上游会拒绝）。
+const thinkingCompatReq = `{"model":"x","thinking":{"type":"adaptive"},"messages":[
+	{"role":"user","content":"hi"},
+	{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"bash","input":{}}]},
+	{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"out"}]}
+]}`
+
+// TestThinkingCompat_PatchApplied：thinking_compat=true 时，同格式 claude 透传
+// 给缺 thinking 块的 assistant(tool_use) 轮次补空 thinking 块（content[0]），
+// 原 tool_use 保留在 content[1]，模型仍改写为配置值。
+func TestThinkingCompat_PatchApplied(t *testing.T) {
+	upstreamSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req map[string]any
+		if err := json.Unmarshal(body, &req); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if req["model"] != "m" {
+			t.Fatalf("model not rewritten: %v", req["model"])
+		}
+		msgs, _ := req["messages"].([]any)
+		assistant, ok := msgs[1].(map[string]any)
+		if !ok || assistant["role"] != "assistant" {
+			t.Fatalf("messages[1] not assistant: %s", body)
+		}
+		content, _ := assistant["content"].([]any)
+		if len(content) != 2 {
+			t.Fatalf("assistant content length: %d (want 2): %s", len(content), body)
+		}
+		first, ok := content[0].(map[string]any)
+		if !ok || first["type"] != "thinking" {
+			t.Fatalf("assistant(tool_use) missing thinking block: %s", body)
+		}
+		if th, _ := first["thinking"].(string); th != "" {
+			t.Fatalf("thinking block not empty: %s", body)
+		}
+		second, ok := content[1].(map[string]any)
+		if !ok || second["type"] != "tool_use" {
+			t.Fatalf("tool_use not preserved: %s", body)
+		}
+		w.Write([]byte(claudeMockResponse("m", "ok")))
+	}))
+	defer upstreamSrv.Close()
+	cfg := &config.Config{
+		Upstreams: map[string]config.UpstreamConfig{
+			"main": {BaseURL: upstreamSrv.URL + "/v1", APIKey: "sk", Format: "claude", Model: "m", ThinkingCompat: true},
+		},
+	}
+	srv := NewWithConfig(cfg, upstream.NewClient(), slog.Default())
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+	resp, err := http.Post(ts.URL+"/v1/messages", "application/json", strings.NewReader(thinkingCompatReq))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status: %d body: %s", resp.StatusCode, body)
+	}
+}
+
+// TestThinkingCompat_DisabledPassthrough：thinking_compat 默认 false →
+// body 原样透传，assistant(tool_use) 不被补 thinking 块（content 保持单个 tool_use）。
+func TestThinkingCompat_DisabledPassthrough(t *testing.T) {
+	upstreamSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req map[string]any
+		if err := json.Unmarshal(body, &req); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		msgs, _ := req["messages"].([]any)
+		assistant, ok := msgs[1].(map[string]any)
+		if !ok || assistant["role"] != "assistant" {
+			t.Fatalf("messages[1] not assistant: %s", body)
+		}
+		content, _ := assistant["content"].([]any)
+		if len(content) != 1 {
+			t.Fatalf("assistant content modified (want 1 block): %s", body)
+		}
+		first, ok := content[0].(map[string]any)
+		if !ok || first["type"] == "thinking" {
+			t.Fatalf("unexpected thinking block: %s", body)
+		}
+		if first["type"] != "tool_use" {
+			t.Fatalf("tool_use not passthrough: %s", body)
+		}
+		w.Write([]byte(claudeMockResponse("m", "ok")))
+	}))
+	defer upstreamSrv.Close()
+	cfg := &config.Config{
+		Upstreams: map[string]config.UpstreamConfig{
+			"main": {BaseURL: upstreamSrv.URL + "/v1", APIKey: "sk", Format: "claude", Model: "m"},
+		},
+	}
+	srv := NewWithConfig(cfg, upstream.NewClient(), slog.Default())
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+	resp, err := http.Post(ts.URL+"/v1/messages", "application/json", strings.NewReader(thinkingCompatReq))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status: %d body: %s", resp.StatusCode, body)
+	}
+}

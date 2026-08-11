@@ -37,6 +37,15 @@ func (s *Server) relay(w http.ResponseWriter, r *http.Request, cfg *config.Confi
 		if err != nil {
 			return err
 		}
+		if up.ThinkingCompat && format == "claude" {
+			// AIGW/DeepSeek 类上游：thinking 模式下 tool_use 轮次必须回传
+			// thinking 块，补空 thinking 块（Anthropic 官方校验 signature，
+			// 由 thinking_compat 开关显式启用）
+			outbound, _, err = route.EnsureThinkingBlocks("claude", outbound)
+			if err != nil {
+				return err
+			}
+		}
 		return s.forward(w, r, &up, outbound, format, d, rec)
 	}
 	// 交叉格式：转换请求
