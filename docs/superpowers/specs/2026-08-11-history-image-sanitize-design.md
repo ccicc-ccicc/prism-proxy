@@ -18,7 +18,7 @@
 
 ## 2. 目标
 
-1. 只有**新一轮传图**（最后一条 user 消息含图）才切 vision。
+1. 只有**新一轮传图**（末尾用户侧消息 run 含图）才切 vision。
 2. 纯文本轮次走 `main`，历史图块替换为轻量标记，模型通过历史中 assistant 的解析文本保持语义理解。
 3. 不静默丢图：最新消息的图永不脱敏（要么切 vision，要么原样走 main 显式报错）。
 4. 无状态实现：不引入会话 ID、内存缓存等跨请求状态。
@@ -27,26 +27,31 @@
 
 ### 3.1 检测语义收窄
 
-`route.RequestHasImage` 改为只检测**最后一条 user 消息**，更名 `LatestMessageHasImage`：
+`route.RequestHasImage` 改为只检测**末尾"用户侧消息 run"**，更名 `LatestUserRunHasImage`：
 
-- Claude 格式：遍历 `MessagesRequest.Messages`，定位最后一条 `role == "user"` 的消息，递归检查其 content（含 `tool_result.content` 内嵌 image block）。
-- OpenAI 格式：只检查 messages 数组最后一条消息的 content 数组（`image_url` part）。
+- **锚点定义（统一两种格式）**：从消息序列末尾向前，取中间无 assistant 消息打断的连续"用户侧"消息段（run）：
+  - Claude 格式：末尾连续的 `role == "user"` 消息段（`tool_result` 由 user 消息携带；`role == "assistant"` 消息打断 run）。
+  - OpenAI 格式：末尾连续的 `role == "user"` 或 `role == "tool"` 消息段（工具结果由 tool role 消息携带；`role == "assistant"` 消息打断 run）。
+  - 序列以 assistant 消息结尾时，run 为其前最后一段连续用户侧消息。
+- **检测**：run 内任一消息含图 → true（Claude 递归检查 content，含 `tool_result.content` 内嵌 image block；OpenAI 检查 content 数组中 `image_url` part）。
+- **边界**：run 为空（消息序列无 user/tool 消息，异常请求）→ 返回 false。
 - 单消息请求（无历史重放）行为与全量检测等价，无差异。
+
+> **为何用 run 而非单条消息**：客户端可能把同一轮内容拆成多条连续 user 消息（首条带图、末条纯文本）。若只查最后一条，新图被误判为历史，走 main 脱敏后本轮静默丢图——检测必须覆盖整段用户侧 run。
 
 ### 3.2 历史图片替换（Sanitize）
 
 新增 `route.SanitizeHistoryImages(format, body []byte) ([]byte, bool, error)`：
 
-- 遍历边界（与 §3.1 检测语义一致，随格式）：
-  - Claude 格式：**除最后一条 `role == "user"` 消息外**的所有消息（tool_result 由 user 消息携带，最后一条 user 消息即"用户最后发出的内容"）。
-  - OpenAI 格式：**除最后一条消息外**的所有消息（工具结果由 tool role 消息携带，最后一条消息即等价语义）。
+- 遍历边界（与 §3.1 锚点一致，随格式）：**run 之前的所有消息**（run 即末尾用户侧消息段；run 为空 → 脱敏 no-op，原样返回、sanitized=false）。
+- **实现策略（重要）**：必须 **map 基遍历**（`[]any` / `map[string]any`），**禁止 typed struct 往返**。原因：typed 反序列化-再序列化（如 `MessagesRequest`/`ClaudeBlock`）会静默丢弃结构体未定义的字段——Claude Code 在块级携带 `cache_control`（prompt caching）、消息级携带 `metadata` 等，丢弃会破坏 main 上游的 prompt caching（每轮重新计费，与成本目标直接冲突）。map 基遍历只替换图片块，其余键原样保留（含 `tool_result` 的 `is_error`/`tool_use_id`）。与现有 `rewriteModel` 的 map 基做法一致。
 - Claude 格式：
   - `image` block → `{"type": "text", "text": "[image: analyzed in previous reply]"}`
   - `tool_result` 的 content 数组内嵌 `image` block 递归替换
 - OpenAI 格式：
   - content 数组中 `image_url` part → `{"type": "text", "text": "[image: analyzed in previous reply]"}`
 - 同消息的 text part/block 原样保留。
-- **回退规则**：含图消息之后**紧邻的下一条 assistant 消息**（中间不含其他 user 消息）不存在文本回复（异常历史）时，标记降级为 `[image omitted]`。
+- **回退规则**：含图消息之后**向后扫描**到下一个含**非空 text 块**的 assistant 消息（可跨过中间的 `tool_use`/user 工具循环消息——工具循环中截图后的紧邻 assistant 常是无文本的 `tool_use`，解析文本在更靠后的 assistant 消息里），扫到序列末尾仍无 → 标记降级为 `[image omitted]`。
 - 返回：替换后的 body、是否发生替换（bool）、错误（解析失败 → error，与 `Decide` 一致走 400）。
 
 **语义原理**：模型对图片的解析文本（assistant 回复）**本来就在请求历史中**，原位保留即可——模型读到"user 发了图" + "assistant 分析了图"，语义完整。图片块无需复制解析文本，只需替换为短标记，token 从 base64（~1-2k token）降到 ~10 token。
@@ -74,7 +79,7 @@ if decision.Upstream == "main" && cfg.AutoSwitchVision {
 
 `auto_switch_vision: true`：
 
-| 最后一条 user 消息 | 路由 | 历史图处理 |
+| 末尾用户侧消息 run | 路由 | 历史图处理 |
 |---|---|---|
 | 含图 | vision | 保留（body 原样） |
 | 无图，历史含图 | main | 替换为短标记，assistant 解析文本原位保留 |
@@ -83,25 +88,29 @@ if decision.Upstream == "main" && cfg.AutoSwitchVision {
 边界：
 
 - `auto_switch_vision: false` → 完全原样，任何图不处理。
-- 无 vision 上游 → 落回 main，最新图不脱敏（显式报错），历史图脱敏。
+- 无 vision 上游 → 落回 main，最新图不脱敏（显式报错），历史图脱敏。**注意**：`config.Validate` 对 `auto_switch_vision: true` 缺 vision 上游是启动 fail-fast（热加载失败保留旧配置），此路径仅测试直接构造 config 或热加载竞态下可达——防御路径，实现时不为它加额外分支。
 
 ## 5. 代码改动清单
 
 | 文件 | 改动 |
 |---|---|
-| `internal/route/route.go` | `LatestMessageHasImage`（改语义+更名）、`SanitizeHistoryImages`（新增）、`Decision` 加 `ImagesSanitized bool` 字段 |
-| `internal/server/server.go` | `ServeHTTP` 挂接脱敏；`log()` 输出 `images_sanitized` |
+| `internal/route/route.go` | `LatestUserRunHasImage`（改语义+更名）、`SanitizeHistoryImages`（新增，map 基实现）、`Decision` 加 `ImagesSanitized bool` 字段 |
+| `internal/server/server.go` | `ServeHTTP` 挂接脱敏；`log()` 输出 `images_sanitized`；`image_detected` 日志语义随 `HasImage` 更名变化（见下） |
+
+**日志语义（随检测收窄变化）**：`image_detected`（server.go `log()` 中 `HasImage && !VisionSwitch` 分支）从"全量含图"变为"末尾用户侧 run 含图"。`auto_switch_vision: false` 且历史含图走 main 时：既无 `image_detected` 也无 `images_sanitized`，上游 400 原因不可见——接受此观测空白（false 模式为完全原样），不为此加独立标记。
 | `README.md` | 更新 `auto_switch_vision` 语义说明 |
 | 测试 | 见 §6 |
 
 ## 6. 测试计划
 
 - `internal/route/route_test.go`：
-  - `LatestMessageHasImage`：最后一条 user 消息含图 → true；历史含图但最新无图 → false；tool_result 内嵌图 → true；OpenAI 格式最后一条消息；历史图不触发。
-  - `SanitizeHistoryImages`（表驱动）：Claude image block、Claude tool_result 内嵌、OpenAI image_url、无 assistant 回复回退 `[image omitted]`、最新消息不动、混合 text 保留、解析失败返回 error。
+  - `LatestUserRunHasImage`：末尾 run 含图 → true；历史含图但 run 无图 → false；tool_result 内嵌图 → true；OpenAI `role=tool` 消息含图 → true；**连续 user 消息 run（首条带图、末条纯文本）→ true**；**无 user/tool 消息 → false**；OpenAI 最后一条为 assistant 消息（run 为其前段）。
+  - `SanitizeHistoryImages`（表驱动）：Claude image block、Claude tool_result 内嵌、OpenAI image_url、**工具循环回退（`[user(tool_result+图), assistant(tool_use 无文本), assistant(含文本)]` → analyzed 标记）**、无含文本 assistant 消息 → `[image omitted]`、run 内消息不动、混合 text 保留、**map 基往返保留未知键（块级 `cache_control`、`tool_result` 的 `is_error`/`tool_use_id`）**、**无图时 no-op 幂等（sanitized=false、body 逐字节一致）**、解析失败返回 error、**run 为空 → no-op**。
 - `internal/server/integration_test.go`：
   - 历史图 + 纯文本轮次 → main 上游收到**无图** body。
   - 最新图轮次 → vision 上游收到**原样** body。
+  - **交叉格式**：OpenAI 入站→Claude 上游 main、Claude 入站→OpenAI 上游 main，脱敏 body 经转换管线后无图。
+  - **脱敏与 `rewriteModel` 共存**：走 main 时 model 改写与历史图脱敏同时生效。
   - `auto_switch_vision: false` → body 原样转发（现状回归）。
 - 现有 `RequestHasImage` 相关测试同步更名/语义更新。
 - 验证：`go test -race ./...` + `go test -cover ./...`（保持 80%+ 覆盖率）。
@@ -121,4 +130,5 @@ if decision.Upstream == "main" && cfg.AutoSwitchVision {
 ## 9. 风险
 
 - 语义损失仅限"纯文本轮次模型看不到历史图"，但 assistant 解析文本仍在历史中，问答可继续；用户在新会话重新传图即恢复完整视觉上下文。
-- `LatestMessageHasImage` 语义变更对重放历史的客户端是新行为（预期），对单消息客户端无差异。
+- `LatestUserRunHasImage` 语义变更对重放历史的客户端是新行为（预期），对单消息客户端无差异。连续 user 消息场景（首条带图、末条纯文本）由 run 锚点覆盖，新图不会被误判为历史。
+- 脱敏必须 map 基实现（见 §3.2）：若误用 typed 往返会丢 `cache_control`，破坏 main 上游 prompt caching——实现计划中列为强制要求。
