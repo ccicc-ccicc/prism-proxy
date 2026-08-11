@@ -1,6 +1,8 @@
 package route
 
 import (
+	"encoding/json"
+	"strings"
 	"testing"
 
 	"prism-proxy/internal/config"
@@ -175,6 +177,146 @@ func TestLatestUserRunHasImage_OpenAIToolRole(t *testing.T) {
 
 func TestLatestUserRunHasImage_InvalidBody(t *testing.T) {
 	_, err := LatestUserRunHasImage("openai", []byte("{not json"))
+	if err == nil {
+		t.Fatal("expected error")
+	}
+}
+
+const markAnalyzed = "[image: analyzed in previous reply]"
+const markOmitted = "[image omitted]"
+
+func TestSanitize_ClaudeImageBlockReplaced(t *testing.T) {
+	body := []byte(`{"model":"x","messages":[
+		{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}]},
+		{"role":"assistant","content":[{"type":"text","text":"图中是仪表盘。"}]},
+		{"role":"user","content":"数字是多少"}
+	]}`)
+	out, changed, err := SanitizeHistoryImages("claude", body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changed {
+		t.Fatal("expected sanitize")
+	}
+	var m map[string]any
+	_ = json.Unmarshal(out, &m)
+	msgs := m["messages"].([]any)
+	blocks := msgs[0].(map[string]any)["content"].([]any)
+	first := blocks[0].(map[string]any)
+	if first["type"] != "text" || first["text"] != markAnalyzed {
+		t.Fatalf("marker: %v", first)
+	}
+	// assistant 解析文本原位保留
+	text := msgs[1].(map[string]any)["content"].([]any)[0].(map[string]any)
+	if text["text"] != "图中是仪表盘。" {
+		t.Fatalf("assistant text mutated: %v", text)
+	}
+	// run 内消息（最后一条）不动
+	last := msgs[2].(map[string]any)
+	if last["content"] != "数字是多少" {
+		t.Fatalf("latest message mutated: %v", last)
+	}
+}
+
+func TestSanitize_ClaudeNoAssistantText(t *testing.T) {
+	// 含图消息后无含文本 assistant 消息 → omitted 标记
+	body := []byte(`{"model":"x","messages":[
+		{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}]},
+		{"role":"user","content":"继续"}
+	]}`)
+	out, changed, err := SanitizeHistoryImages("claude", body)
+	if err != nil || !changed {
+		t.Fatalf("sanitize: %v %v", changed, err)
+	}
+	if !strings.Contains(string(out), markOmitted) {
+		t.Fatalf("expected omitted marker, got: %s", out)
+	}
+}
+
+func TestSanitize_ToolLoopFallback(t *testing.T) {
+	// 工具循环：截图后紧邻 assistant 是 tool_use（无文本），解析文本在更靠后的 assistant → analyzed
+	body := []byte(`{"model":"x","messages":[
+		{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}]}]},
+		{"role":"assistant","content":[{"type":"tool_use","id":"t2","name":"search","input":{}}]},
+		{"role":"user","content":[{"type":"tool_result","tool_use_id":"t2","content":"nothing found"}]},
+		{"role":"assistant","content":[{"type":"text","text":"截图中是登录页。"}]},
+		{"role":"user","content":"继续"}
+	]}`)
+	out, changed, err := SanitizeHistoryImages("claude", body)
+	if err != nil || !changed {
+		t.Fatalf("sanitize: %v %v", changed, err)
+	}
+	if !strings.Contains(string(out), markAnalyzed) {
+		t.Fatalf("expected analyzed marker (scan across tool loop), got: %s", out)
+	}
+}
+
+func TestSanitize_OpenAIImageURLReplaced(t *testing.T) {
+	body := []byte(`{"model":"x","messages":[
+		{"role":"user","content":[{"type":"text","text":"看"},{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}]},
+		{"role":"assistant","content":"图上有一个按钮"},
+		{"role":"user","content":"点哪里"}
+	]}`)
+	out, changed, err := SanitizeHistoryImages("openai", body)
+	if err != nil || !changed {
+		t.Fatalf("sanitize: %v %v", changed, err)
+	}
+	var m map[string]any
+	_ = json.Unmarshal(out, &m)
+	content := m["messages"].([]any)[0].(map[string]any)["content"].([]any)
+	if len(content) != 2 || content[1].(map[string]any)["type"] != "text" {
+		t.Fatalf("parts: %v", content)
+	}
+	if content[0].(map[string]any)["text"] != "看" {
+		t.Fatalf("text part mutated: %v", content[0])
+	}
+}
+
+func TestSanitize_CacheControlPreserved(t *testing.T) {
+	// map 基往返：块级 cache_control 与 tool_result 的 is_error/tool_use_id 保留
+	body := []byte(`{"model":"x","messages":[
+		{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"},"cache_control":{"type":"ephemeral"}}]},
+		{"role":"assistant","content":[{"type":"text","text":"ok","cache_control":{"type":"ephemeral"}}]},
+		{"role":"user","content":"继续"}
+	]}`)
+	out, changed, err := SanitizeHistoryImages("claude", body)
+	if err != nil || !changed {
+		t.Fatalf("sanitize: %v %v", changed, err)
+	}
+	if !strings.Contains(string(out), `"cache_control"`) {
+		t.Fatalf("cache_control lost: %s", out)
+	}
+}
+
+func TestSanitize_NoImageNoop(t *testing.T) {
+	// 无图 → no-op：body 逐字节一致，sanitized=false
+	body := []byte(`{"model":"x","messages":[{"role":"user","content":"hi"}]}`)
+	out, changed, err := SanitizeHistoryImages("claude", body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed {
+		t.Fatal("expected no change")
+	}
+	if string(out) != string(body) {
+		t.Fatalf("body not byte-identical: %s", out)
+	}
+}
+
+func TestSanitize_NoUserRunNoop(t *testing.T) {
+	// run 为空（无 user/tool 消息）→ no-op
+	body := []byte(`{"model":"x","messages":[{"role":"assistant","content":"hi"}]}`)
+	out, changed, err := SanitizeHistoryImages("claude", body)
+	if err != nil || changed {
+		t.Fatalf("expected noop: %v %v", changed, err)
+	}
+	if string(out) != string(body) {
+		t.Fatalf("body not byte-identical: %s", out)
+	}
+}
+
+func TestSanitize_InvalidBody(t *testing.T) {
+	_, _, err := SanitizeHistoryImages("openai", []byte("{not json"))
 	if err == nil {
 		t.Fatal("expected error")
 	}

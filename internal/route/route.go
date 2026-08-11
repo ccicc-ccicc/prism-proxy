@@ -8,6 +8,11 @@ import (
 	"prism-proxy/internal/convert"
 )
 
+const (
+	analyzedMark = "[image: analyzed in previous reply]"
+	omittedMark  = "[image omitted]"
+)
+
 type Decision struct {
 	Upstream     string
 	Model        string
@@ -78,4 +83,127 @@ func LatestUserRunHasImage(format string, body []byte) (bool, error) {
 		}
 	}
 	return false, nil
+}
+
+// SanitizeHistoryImages 将 run（最后一条用户侧消息）之前历史消息中的图片块替换为文本标记，
+// assistant 解析文本原位保留（语义由历史中相邻的 assistant 回复承载）。
+// 必须 map 基遍历：typed 往返会丢弃 cache_control/metadata 等未知字段。
+// run 为空或无图 → no-op（返回原 body 字节、sanitized=false）。
+func SanitizeHistoryImages(format string, body []byte) ([]byte, bool, error) {
+	var root map[string]any
+	if err := json.Unmarshal(body, &root); err != nil {
+		return nil, false, fmt.Errorf("parse %s request: %w", format, err)
+	}
+	msgs, ok := root["messages"].([]any)
+	if !ok {
+		return nil, false, fmt.Errorf("parse %s request: missing messages", format)
+	}
+	userRoles := map[string]bool{"user": true}
+	if format == "openai" {
+		userRoles["tool"] = true
+	}
+	// run = 最后一条用户侧消息：先跳过尾部非用户侧消息；run 为空（end<0）→ 不遍历（no-op）。
+	// 连续用户侧段内更早的消息视为历史（走 main 时一并脱敏）。
+	end := len(msgs) - 1
+	for ; end >= 0; end-- {
+		m, ok := msgs[end].(map[string]any)
+		if !ok {
+			break
+		}
+		role, _ := m["role"].(string)
+		if userRoles[role] {
+			break
+		}
+	}
+	changed := false
+	for i := 0; i < end; i++ {
+		m, ok := msgs[i].(map[string]any)
+		if !ok {
+			continue
+		}
+		content, has := m["content"]
+		if !has {
+			continue
+		}
+		if sanitizeContent(content, hasTextAssistantAfter(msgs, i)) {
+			changed = true
+		}
+	}
+	if !changed {
+		return body, false, nil // no-op 幂等：逐字节原样
+	}
+	out, err := json.Marshal(root)
+	if err != nil {
+		return nil, false, fmt.Errorf("marshal %s request: %w", format, err)
+	}
+	return out, true, nil
+}
+
+// sanitizeContent 递归替换 content 中的图片块（image/image_url，含 tool_result 内嵌），
+// 其余键原样保留。replay 指示含图消息之后是否有含文本的 assistant 消息（选标记）。
+func sanitizeContent(content any, replay bool) bool {
+	parts, ok := content.([]any)
+	if !ok {
+		return false
+	}
+	changed := false
+	for idx, p := range parts {
+		pm, ok := p.(map[string]any)
+		if !ok {
+			continue
+		}
+		switch pm["type"] {
+		case "image", "image_url":
+			mark := analyzedMark
+			if !replay {
+				mark = omittedMark
+			}
+			parts[idx] = map[string]any{"type": "text", "text": mark}
+			changed = true
+		case "tool_result":
+			if inner, ok := pm["content"].([]any); ok && sanitizeContent(inner, replay) {
+				changed = true
+			}
+		}
+	}
+	return changed
+}
+
+// hasTextAssistantAfter 扫描 msgs[i] 之后是否存在含非空文本的 assistant 消息
+// （跨过 tool_use 循环中间消息：无文本 assistant 不中断扫描，继续向后找）。
+func hasTextAssistantAfter(msgs []any, i int) bool {
+	for j := i + 1; j < len(msgs); j++ {
+		m, ok := msgs[j].(map[string]any)
+		if !ok {
+			continue
+		}
+		if role, _ := m["role"].(string); role != "assistant" {
+			continue
+		}
+		if msgHasText(m["content"]) {
+			return true
+		}
+	}
+	return false
+}
+
+// msgHasText：消息含非空文本（string 非空，或 []any 中存在非空 text 块）。
+func msgHasText(content any) bool {
+	switch c := content.(type) {
+	case string:
+		return c != ""
+	case []any:
+		for _, p := range c {
+			pm, ok := p.(map[string]any)
+			if !ok {
+				continue
+			}
+			if pm["type"] == "text" {
+				if t, ok := pm["text"].(string); ok && t != "" {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
