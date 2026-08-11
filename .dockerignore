@@ -1,0 +1,10 @@
+# 构建上下文排除：git 元数据与本地构建产物
+.git
+bin/
+dist/
+
+# 日志
+*.log
+
+# 本地配置（含上游 API 密钥，绝不进镜像）
+prism-proxy.yaml

@@ -2,8 +2,10 @@ package server
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -13,6 +15,7 @@ import (
 	"prism-proxy/internal/config"
 	"prism-proxy/internal/convert"
 	"prism-proxy/internal/route"
+	"prism-proxy/internal/trafficlog"
 	"prism-proxy/internal/upstream"
 )
 
@@ -26,9 +29,10 @@ type cfgProvider interface {
 }
 
 type Server struct {
-	cfg    cfgProvider
-	client *upstream.Client
-	logger *slog.Logger
+	cfg     cfgProvider
+	client  *upstream.Client
+	logger  *slog.Logger
+	traffic *trafficlog.TrafficLog // nil = 不记录内容日志
 }
 
 func New(cfg *config.Watcher, client *upstream.Client, logger *slog.Logger) *Server {
@@ -39,6 +43,16 @@ func New(cfg *config.Watcher, client *upstream.Client, logger *slog.Logger) *Ser
 func NewWithConfig(cfg *config.Config, client *upstream.Client, logger *slog.Logger) *Server {
 	w := &staticWatcher{cfg: cfg}
 	return &Server{cfg: w, client: client, logger: logger}
+}
+
+// SetTrafficLog 注入内容日志（main 启动时调用；测试可注入内存 writer）。
+func (s *Server) SetTrafficLog(tl *trafficlog.TrafficLog) { s.traffic = tl }
+
+// newRequestID 生成短请求 ID：低 32 位纳秒时间戳 + 4 字节随机 hex。
+func newRequestID() string {
+	var b [4]byte
+	_, _ = rand.Read(b[:])
+	return fmt.Sprintf("%x-%x", time.Now().UnixNano()&0xffffffff, b)
 }
 
 type staticWatcher struct{ cfg *config.Config }
@@ -59,33 +73,66 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	cfg := s.cfg.Get()
 	if !s.authenticated(r, cfg) {
-		writeError(w, format, http.StatusUnauthorized, "invalid api key")
+		writeError(w, format, http.StatusUnauthorized, "invalid api key", nil)
 		return
+	}
+	// 内容日志（仅 enabled）：每请求 recorder，defer 统一 flush
+	var rec *trafficlog.Recorder
+	stream := false
+	if s.traffic != nil && cfg.Logging.Enabled {
+		rid := newRequestID()
+		w.Header().Set("X-Request-Id", rid)
+		rec = trafficlog.NewRecorder(s.traffic.Dir(), rid, format)
+		defer func() { s.flushTraffic(rec, start, stream) }()
 	}
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxBody+1))
 	if err != nil {
-		writeError(w, format, http.StatusBadRequest, "read body: "+err.Error())
+		if rec != nil {
+			rec.SetError(fmt.Errorf("read body: %w", err))
+			rec.SetStatus(http.StatusBadRequest)
+		}
+		writeError(w, format, http.StatusBadRequest, "read body: "+err.Error(), rec)
 		return
 	}
 	if len(body) > maxBody {
-		writeError(w, format, http.StatusRequestEntityTooLarge, "request too large")
+		if rec != nil {
+			rec.SetError(fmt.Errorf("request too large: %d bytes exceeds %d", len(body), maxBody))
+			rec.SetStatus(http.StatusRequestEntityTooLarge)
+		}
+		writeError(w, format, http.StatusRequestEntityTooLarge, "request too large", rec)
 		return
+	}
+	stream = requestStream(format, body)
+	if rec != nil {
+		rec.SetInbound(body)
 	}
 	decision, err := route.Decide(cfg, format, body)
 	if err != nil {
-		writeError(w, format, http.StatusBadRequest, "invalid request: "+err.Error())
+		if rec != nil {
+			rec.SetError(err)
+			rec.SetStatus(http.StatusBadRequest)
+		}
+		writeError(w, format, http.StatusBadRequest, "invalid request: "+err.Error(), rec)
 		return
 	}
 	if decision.Upstream == "main" && cfg.AutoSwitchVision {
 		var sanitized bool
 		body, sanitized, err = route.SanitizeHistoryImages(format, body)
 		if err != nil {
-			writeError(w, format, http.StatusBadRequest, "invalid request: "+err.Error())
+			if rec != nil {
+				rec.SetError(err)
+				rec.SetStatus(http.StatusBadRequest)
+			}
+			writeError(w, format, http.StatusBadRequest, "invalid request: "+err.Error(), rec)
 			return
 		}
 		decision.ImagesSanitized = sanitized
 	}
-	if err := s.relay(w, r, cfg, format, body, decision); err != nil {
+	if rec != nil {
+		up := cfg.Upstreams[decision.Upstream]
+		rec.SetDecision(decision.Upstream, up.Format, decision.Model)
+	}
+	if err := s.relay(w, r, cfg, format, body, decision, rec); err != nil {
 		// 请求转换失败回 400；上游来源失败回 502（读取/解析上游响应）；
 		// 上游响应超限回 413。错误信封一律用入站格式（writeError）。
 		status := http.StatusBadRequest
@@ -99,9 +146,25 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if status != http.StatusBadRequest {
 			msg = err.Error()
 		}
-		s.log(start, format, decision, cfg.Upstreams[decision.Upstream], status, false, err)
-		writeError(w, format, status, msg)
+		if rec != nil {
+			rec.SetError(err)
+			rec.SetStatus(status)
+		}
+		s.log(start, format, decision, cfg.Upstreams[decision.Upstream], status, stream, err, rec)
+		writeError(w, format, status, msg, rec)
 		return
+	}
+	if rec != nil {
+		rec.SetStatus(http.StatusOK)
+	}
+}
+
+// flushTraffic 将 recorder 组装为条目写入内容日志；失败不阻塞请求。
+func (s *Server) flushTraffic(rec *trafficlog.Recorder, start time.Time, stream bool) {
+	defer rec.Close()
+	entry := rec.Entry(stream, time.Since(start))
+	if err := s.traffic.WriteEntry(entry); err != nil {
+		s.logger.Error("traffic log write failed", "request_id", entry.RequestID, "err", err)
 	}
 }
 
@@ -109,7 +172,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // OpenAI → {"error":{"message":...,"type":...}}；
 // Claude → {"type":"error","error":{"type":...,"message":...}}。
 // 认证失败用 authentication_error，其余用 invalid_request_error。
-func writeError(w http.ResponseWriter, format string, status int, message string) {
+// rec 非 nil 时同时记录信封为出站响应。
+func writeError(w http.ResponseWriter, format string, status int, message string, rec *trafficlog.Recorder) {
 	etype := "invalid_request_error"
 	if status == http.StatusUnauthorized {
 		etype = "authentication_error"
@@ -122,6 +186,10 @@ func writeError(w http.ResponseWriter, format string, status int, message string
 		})
 	} else {
 		payload, _ = json.Marshal(convert.ErrorResponse{Error: convert.ErrorDetail{Message: message, Type: etype}})
+	}
+	if rec != nil {
+		rec.SetStatus(status)
+		rec.SetOutboundResponse(payload)
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -194,7 +262,7 @@ func rewriteModel(format string, body []byte, model string) ([]byte, error) {
 	return json.Marshal(m)
 }
 
-func (s *Server) log(start time.Time, format string, d route.Decision, up config.UpstreamConfig, status int, stream bool, err error) {
+func (s *Server) log(start time.Time, format string, d route.Decision, up config.UpstreamConfig, status int, stream bool, err error, rec *trafficlog.Recorder) {
 	attrs := []any{
 		"inbound", format,
 		"upstream", d.Upstream,
@@ -204,6 +272,9 @@ func (s *Server) log(start time.Time, format string, d route.Decision, up config
 		"stream", stream,
 		"status", status,
 		"duration_ms", time.Since(start).Milliseconds(),
+	}
+	if rec != nil {
+		attrs = append(attrs, "request_id", rec.RequestID())
 	}
 	if d.HasImage && !d.VisionSwitch {
 		// spec §7：检测到图片但未切换（开关关/无 vision 上游）时记录

@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -17,6 +18,7 @@ import (
 
 	"prism-proxy/internal/config"
 	"prism-proxy/internal/convert"
+	"prism-proxy/internal/trafficlog"
 	"prism-proxy/internal/upstream"
 )
 
@@ -793,5 +795,45 @@ func TestDownloadImage_RedirectCap(t *testing.T) {
 	src, err := downloadImage(imgSrv2.URL + "/a")
 	if err != nil || src.MediaType != "image/png" {
 		t.Fatalf("1 redirect should succeed: %+v %v", src, err)
+	}
+}
+
+func TestTrafficLog_StreamingFullCapture(t *testing.T) {
+	var buf bytes.Buffer
+	tl := trafficlog.NewWithWriter(&buf)
+	upstreamSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"hel\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n\ndata: [DONE]\n\n"))
+	}))
+	defer upstreamSrv.Close()
+	cfg := &config.Config{
+		Logging: config.LoggingConfig{Enabled: true, Dir: t.TempDir(), MaxFiles: intPtr(3)},
+		Upstreams: map[string]config.UpstreamConfig{
+			"main": {BaseURL: upstreamSrv.URL + "/v1", APIKey: "sk", Format: "openai", Model: "gpt-4o"},
+		},
+	}
+	srv := NewWithConfig(cfg, upstream.NewClient(), slog.Default())
+	srv.SetTrafficLog(tl)
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+	resp, err := http.Post(ts.URL+"/v1/messages", "application/json",
+		strings.NewReader(`{"max_tokens":64,"stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	var e map[string]any
+	if err := json.Unmarshal([]byte(strings.TrimSpace(buf.String())), &e); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if e["stream"] != true {
+		t.Fatalf("stream: %v", e["stream"])
+	}
+	if !strings.Contains(e["upstream_response"].(string), "data: {\"choices\"") || !strings.Contains(e["upstream_response"].(string), "[DONE]") {
+		t.Fatalf("upstream stream incomplete: %v", e["upstream_response"])
+	}
+	if !strings.Contains(e["outbound_response"].(string), "message_stop") {
+		t.Fatalf("outbound stream missing stop: %v", e["outbound_response"])
 	}
 }
