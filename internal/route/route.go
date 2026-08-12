@@ -14,11 +14,14 @@ const (
 )
 
 type Decision struct {
-	Upstream        string
-	Model           string
-	VisionSwitch    bool
-	HasImage        bool // 入站请求末尾用户侧 run 是否含图（spec §7：命中但不切换时日志标记 image_detected）
-	ImagesSanitized bool // 历史图片已被替换为文本标记（仅走 main 且 auto_switch_vision 时可能）
+	Upstream           string
+	Model              string
+	VisionSwitch       bool
+	HasImage           bool  // 入站请求末尾用户侧 run 是否含图（spec §7：命中但不切换时日志标记 image_detected）
+	ImagesSanitized    bool  // 历史图片已被替换为文本标记（仅走 main 且 auto_switch_vision 时可能）
+	NeedPreprocess     bool  // vision 预处理模式：最新 run 含图，需 vision 解析后走 main
+	VisionPreprocess   bool  // 本次请求实际执行了 vision 预处理（日志标记）
+	VisionPreprocessMs int64 // 预处理耗时毫秒数（日志标记）
 }
 
 // Decide 按 spec §4 两条规则决策，忽略请求模型名。
@@ -29,6 +32,10 @@ func Decide(cfg *config.Config, format string, body []byte) (Decision, error) {
 	}
 	if hasImage && cfg.AutoSwitchVision {
 		if vision, ok := cfg.Vision(); ok {
+			if cfg.VisionPreprocess {
+				// 预处理模式：最新图经 vision 解析后走 main（不切上游）
+				return Decision{Upstream: "main", Model: cfg.Main().Model, HasImage: true, NeedPreprocess: true}, nil
+			}
 			return Decision{Upstream: "vision", Model: vision.Model, VisionSwitch: true, HasImage: true}, nil
 		}
 	}
@@ -149,6 +156,101 @@ func SanitizeHistoryImages(format string, body []byte) ([]byte, bool, error) {
 		return nil, false, fmt.Errorf("marshal %s request: %w", format, err)
 	}
 	return out, true, nil
+}
+
+// EnsureThinkingBlocks thinking 模式兼容：assistant(tool_use) 消息缺 thinking 块时，
+// 在 content 头部补 {"type":"thinking","thinking":""}（DeepSeek 系要求 tool_use 轮次
+// 回传 thinking；实测空 thinking 无 signature 可被 AIGW/deepseek 接受）。
+// 触发条件：请求处于 thinking 模式（顶层 thinking 参数存在 或 messages 含 thinking 块）。
+// 仅处理 claude 格式。返回 (新 body, 是否变更, 错误)；无变更时逐字节返回原 body。
+func EnsureThinkingBlocks(format string, body []byte) ([]byte, bool, error) {
+	if format != "claude" {
+		return body, false, nil
+	}
+	var root map[string]any
+	if err := json.Unmarshal(body, &root); err != nil {
+		return nil, false, fmt.Errorf("parse %s request: %w", format, err)
+	}
+	msgs, ok := root["messages"].([]any)
+	if !ok {
+		return nil, false, fmt.Errorf("parse %s request: missing messages", format)
+	}
+	// thinking 模式判定：顶层 thinking 参数存在，或历史含 thinking 块
+	thinkingMode := root["thinking"] != nil
+	if !thinkingMode {
+		for _, m := range msgs {
+			if msgHasThinking(m) {
+				thinkingMode = true
+				break
+			}
+		}
+	}
+	if !thinkingMode {
+		return body, false, nil
+	}
+	changed := false
+	for _, m := range msgs {
+		mm, ok := m.(map[string]any)
+		if !ok {
+			continue
+		}
+		role, _ := mm["role"].(string)
+		if role != "assistant" {
+			continue
+		}
+		content, ok := mm["content"].([]any)
+		if !ok {
+			continue
+		}
+		hasThinking, hasToolUse := false, false
+		for _, b := range content {
+			bm, ok := b.(map[string]any)
+			if !ok {
+				continue
+			}
+			switch bm["type"] {
+			case "thinking":
+				hasThinking = true
+			case "tool_use":
+				hasToolUse = true
+			}
+		}
+		if hasToolUse && !hasThinking {
+			content = append([]any{map[string]any{"type": "thinking", "thinking": ""}}, content...)
+			mm["content"] = content
+			changed = true
+		}
+	}
+	if !changed {
+		return body, false, nil
+	}
+	out, err := json.Marshal(root)
+	if err != nil {
+		return nil, false, fmt.Errorf("marshal %s request: %w", format, err)
+	}
+	return out, true, nil
+}
+
+// msgHasThinking 判断消息是否含 thinking 块（content 为块数组时）。
+func msgHasThinking(m any) bool {
+	mm, ok := m.(map[string]any)
+	if !ok {
+		return false
+	}
+	content, ok := mm["content"].([]any)
+	if !ok {
+		return false
+	}
+	for _, b := range content {
+		bm, ok := b.(map[string]any)
+		if !ok {
+			continue
+		}
+		if bm["type"] == "thinking" {
+			return true
+		}
+	}
+	return false
 }
 
 // sanitizeContent 递归替换 content 中的图片块（image/image_url，含 tool_result 内嵌），

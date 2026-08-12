@@ -13,6 +13,10 @@ import (
 type Config struct {
 	Server           ServerConfig              `yaml:"server"`
 	AutoSwitchVision bool                      `yaml:"auto_switch_vision"`
+	// VisionPreprocess vision 预处理模式：true 时最新轮次图片经 vision 上游单独
+	// 解析为文本后替换进请求再走 main（vision 只收图、main 只收文本，避免
+	// 小窗口 vision 模型上下文超限）；false = 现有行为（整请求切 vision）
+	VisionPreprocess bool                      `yaml:"vision_preprocess"`
 	Logging          LoggingConfig             `yaml:"logging"`
 	Upstreams        map[string]UpstreamConfig `yaml:",inline"`
 }
@@ -49,6 +53,10 @@ type UpstreamConfig struct {
 	// Auth 出站认证头，空 = 按 format 默认（openai → Bearer，claude → x-api-key）；
 	// 显式 "bearer" 或 "x-api-key" 覆盖。网关类上游（如 AIGW）常用 Bearer 认证。
 	Auth string `yaml:"auth"`
+	// ThinkingCompat thinking 模式兼容：给缺 thinking 块的 assistant(tool_use)
+	// 轮次补空 thinking 块（AIGW/DeepSeek 类上游要求回传；Anthropic 官方校验
+	// signature 不适用，默认关）
+	ThinkingCompat bool `yaml:"thinking_compat"`
 }
 
 const defaultTimeout = 120 * time.Second
