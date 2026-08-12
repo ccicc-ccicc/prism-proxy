@@ -32,44 +32,51 @@ vision_preprocess: true   # 默认 false
 原请求（历史 + 最新 run 含图）
   │
   ├─ ① 提取最新 run 内 image 块（base64 + media_type）+ 用户文本（run 内 user 消息 text，排除 tool_result）
+  │     run 边界与 SanitizeHistoryImages / LatestUserRunHasImage 完全一致：
+  │     末尾连续用户侧消息段，任何 assistant（含 tool_use）打断
+  │     （即只提取"最后一段用户侧消息"的图 = 当前活跃内容；工具循环中间的图属历史，走脱敏）
   │
-  ├─ ② 构造 vision 预处理请求（vision 上游格式，非流式）：
+  ├─ ② 构造 vision 预处理请求（vision 上游格式，非流式，max_tokens 必设）：
   │     messages: [user content: [image_url part..., text: 固定指令 + 用户上下文]]
   │     多图合并一次请求；只发图 + 短 prompt（永不超限）
   │
-  ├─ ③ 调 vision 上游 → 解析响应文本（choices[0].message.content）
+  ├─ ③ 调 vision 上游 → 解析响应文本
   │
   ├─ ④ 替换：run 内 image 块 → {"type":"text","text":"[图片内容: <解析文本>]"}
   │
   ├─ ⑤ 历史图脱敏（现有 SanitizeHistoryImages）
   │
-  └─ ⑥ 纯文本请求 → main 上游（relay 现有逻辑）
+  └─ ⑥ 无图请求 → main 上游（relay 现有逻辑）
 ```
 
 ### 3.3 解析 Prompt
 
 ```
-固定指令："请详细描述这张图片的内容：所有可见文本、界面元素、数据、状态。用中文回答。"
+固定指令："请依次详细描述每一张图片的内容：所有可见文本、界面元素、数据、状态。用中文回答。"
 用户上下文（run 内存在 user 文本时追加）："结合用户问题「<文本>」，重点描述图中相关内容。"
 ```
 
 用户文本提取：最新 run 内 `role == "user"` 消息的 text 块/字符串 content，**排除 tool_result 块**（工具输出非用户输入）；无用户文本则只发固定指令。
 
-### 3.4 错误处理
+### 3.4 错误处理与状态码
 
-- vision 预处理失败（非 2xx / 响应解析失败 / 超时）→ 400 报错（`writeError`，显式失败，不静默丢图）。
-- 图片解码/提取失败（异常图块）→ 该图替换为 `[image omitted]`，其余图继续预处理（单图失败不拖垮整请求）。
-- 多图合并请求若 vision 上游超限 → 报错（显式）。
+- **请求侧错误（提取/解析失败、构造失败、占位缺失）→ 400**（`writeError`，显式失败，不静默丢图）。
+- **vision 上游调用失败（非 2xx / 网络 / 超时）→ 502**（与现有 `forward` 的上游失败语义一致；错误信封含上游错误信息）。
+- 单图解码/提取失败 → 该图替换为 `[image omitted]`，其余图继续预处理。
+- **URL 图片来源**（claude `source.type=url` / openai 非 data URL）：预处理模式下降级 `[image omitted]`（当前用户场景为 base64 内嵌截图；URL 下载留待后续，文档化不静默）。
+- 多图合并请求若 vision 上游超限 → 502（上游错误原样语义）。
 
 ### 3.5 观测
 
 - 日志字段：`vision_preprocess: true`（发生预处理）、`vision_preprocess_ms`（预处理耗时）。
+- 预处理请求（`NeedPreprocess=true`）不输出 `image_detected`（避免语义冗余，仅输出 `vision_preprocess`）。
 
 ### 3.6 不做的事（YAGNI）
 
 - 不做解析结果缓存（无状态，每请求独立预处理；同会话内历史图走现有脱敏短标记，不重复预处理）。
 - 不做图片压缩（预处理后 main 无图、vision 无历史，超限结构性消除；压缩留待图本身超单图窗口时再议）。
 - 不改 vision 上游格式（复用现有 vision 配置：openai/claude 均可）。
+- 不下载 URL 图片来源（预处理模式下降级 omitted，见 §3.4）。
 
 ## 4. 行为矩阵
 
