@@ -98,6 +98,51 @@ func TestDecide_InvalidBody(t *testing.T) {
 	}
 }
 
+func TestDecide_VisionPreprocess(t *testing.T) {
+	// VisionPreprocess=true + 最新 run 含图 + 有 vision 上游 → 走 main 且标记预处理
+	cfg := testConfig()
+	cfg.VisionPreprocess = true
+	body := []byte(`{"model":"x","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}]}]}`)
+	d, err := Decide(cfg, "openai", body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !d.NeedPreprocess || d.Upstream != "main" || d.Model != "gpt-4o" || d.VisionSwitch {
+		t.Fatalf("decision: %+v", d)
+	}
+}
+
+func TestDecide_VisionPreprocessDisabled(t *testing.T) {
+	// 默认 false → 现有行为：整请求切 vision
+	body := []byte(`{"model":"x","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}]}]}`)
+	d, err := Decide(testConfig(), "openai", body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.NeedPreprocess || !d.VisionSwitch || d.Upstream != "vision" || d.Model != "claude-3" {
+		t.Fatalf("decision: %+v", d)
+	}
+}
+
+func TestDecide_VisionPreprocessNoVision(t *testing.T) {
+	// 防御：preprocess 开启但无 vision 上游 → 走 main，不 panic、不标记预处理
+	cfg := &config.Config{
+		AutoSwitchVision: true,
+		VisionPreprocess: true,
+		Upstreams: map[string]config.UpstreamConfig{
+			"main": {BaseURL: "https://a/v1", APIKey: "k", Format: "openai", Model: "gpt-4o"},
+		},
+	}
+	body := []byte(`{"model":"x","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}]}]}`)
+	d, err := Decide(cfg, "openai", body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.NeedPreprocess || d.VisionSwitch || d.Upstream != "main" {
+		t.Fatalf("decision: %+v", d)
+	}
+}
+
 func TestLatestUserRunHasImage_HistoryImageNotTrigger(t *testing.T) {
 	// 历史含图（run 之前），最新 run 纯文本 → false（这是本次语义收窄的核心）
 	body := []byte(`{"model":"x","messages":[
