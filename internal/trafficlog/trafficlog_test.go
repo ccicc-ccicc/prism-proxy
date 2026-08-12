@@ -261,6 +261,55 @@ func TestRecorder_SetErrorFirstWins(t *testing.T) {
 	}
 }
 
+func TestRecorder_VisionPreprocessFields(t *testing.T) {
+	dir := t.TempDir()
+	rec := NewRecorder(dir, "rid-vp", "openai")
+	defer rec.Close()
+	rec.SetDecision("main", "claude", "claude-3")
+	rec.SetStatus(200)
+	rec.SetVisionPreprocess("请依次详细描述每一张图片的内容", 2, 4096, "图中是登录页")
+	entry := rec.Entry(false, time.Second)
+	if !entry.VisionPreprocess {
+		t.Fatal("vision_preprocess flag not set")
+	}
+	if entry.VisionPrompt != "请依次详细描述每一张图片的内容" ||
+		entry.VisionImages != 2 || entry.VisionImageBytes != 4096 || entry.VisionResponse != "图中是登录页" {
+		t.Fatalf("vision fields: %+v", entry)
+	}
+	var buf bytes.Buffer
+	tl := NewWithWriter(&buf)
+	if err := tl.WriteEntry(entry); err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(bytes.TrimRight(buf.Bytes(), "\n"), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["vision_preprocess"] != true || got["vision_images"] != float64(2) || got["vision_image_bytes"] != float64(4096) {
+		t.Fatalf("json vision numeric/bool: %s", buf.Bytes())
+	}
+	if got["vision_prompt"] != "请依次详细描述每一张图片的内容" || got["vision_response"] != "图中是登录页" {
+		t.Fatalf("json vision strings: %s", buf.Bytes())
+	}
+}
+
+func TestRecorder_VisionPreprocessOmittedWhenUnset(t *testing.T) {
+	dir := t.TempDir()
+	rec := NewRecorder(dir, "rid-plain", "openai")
+	defer rec.Close()
+	rec.SetDecision("main", "openai", "gpt-4o")
+	var buf bytes.Buffer
+	tl := NewWithWriter(&buf)
+	if err := tl.WriteEntry(rec.Entry(false, 0)); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"vision_preprocess", "vision_prompt", "vision_images", "vision_image_bytes", "vision_response"} {
+		if strings.Contains(buf.String(), key) {
+			t.Fatalf("unexpected key %q in %s", key, buf.String())
+		}
+	}
+}
+
 func TestRecorder_EntrySpillContent(t *testing.T) {
 	dir := t.TempDir()
 	rec := NewRecorder(dir, "rid", "openai")
