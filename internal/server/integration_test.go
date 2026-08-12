@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"prism-proxy/internal/config"
+	"prism-proxy/internal/trafficlog"
 	"prism-proxy/internal/upstream"
 )
 
@@ -921,5 +923,64 @@ func TestVisionPreprocess_URLOmittedSkipsVision(t *testing.T) {
 	case <-visionCalled:
 		t.Fatal("vision was called for URL-only images")
 	default:
+	}
+}
+
+// TestVisionPreprocess_TrafficLog：logging.enabled + 注入 writer 时，预处理子请求信息
+// （vision_preprocess 标记、prompt、图数、图总字节、解析响应）写入主请求 traffic log 条目。
+func TestVisionPreprocess_TrafficLog(t *testing.T) {
+	visionSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		w.Write([]byte(`{"choices":[{"message":{"content":"图中是登录页"}}]}`))
+	}))
+	defer visionSrv.Close()
+	mainSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		w.Write([]byte(claudeMockResponse("main-m", "ok")))
+	}))
+	defer mainSrv.Close()
+
+	var buf bytes.Buffer
+	cfg := &config.Config{
+		AutoSwitchVision: true,
+		VisionPreprocess: true,
+		Logging:          config.LoggingConfig{Enabled: true},
+		Upstreams: map[string]config.UpstreamConfig{
+			"main":   {BaseURL: mainSrv.URL + "/v1", APIKey: "sk", Format: "claude", Model: "main-m"},
+			"vision": {BaseURL: visionSrv.URL + "/v1", APIKey: "sk", Format: "openai", Model: "vision-m"},
+		},
+	}
+	srv := NewWithConfig(cfg, upstream.NewClient(), slog.Default())
+	srv.SetTrafficLog(trafficlog.NewWithWriter(&buf))
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	resp, data := postMessages(t, ts.URL+"/v1/messages", visionPreprocessReq)
+	if resp.StatusCode != 200 {
+		t.Fatalf("status: %d body: %s", resp.StatusCode, data)
+	}
+	lines := bytes.Split(bytes.TrimRight(buf.Bytes(), "\n"), []byte("\n"))
+	if len(lines) != 1 {
+		t.Fatalf("want 1 traffic line, got %d: %s", len(lines), buf.String())
+	}
+	var got map[string]any
+	if err := json.Unmarshal(lines[0], &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["vision_preprocess"] != true {
+		t.Fatalf("vision_preprocess flag missing: %s", lines[0])
+	}
+	if got["vision_images"] != float64(1) {
+		t.Fatalf("vision_images: %v", got["vision_images"])
+	}
+	if got["vision_image_bytes"] != float64(4) { // base64 "AAAA"
+		t.Fatalf("vision_image_bytes: %v", got["vision_image_bytes"])
+	}
+	prompt, _ := got["vision_prompt"].(string)
+	if !strings.Contains(prompt, "请依次详细描述每一张图片的内容") || !strings.Contains(prompt, "结合用户问题「hi」") {
+		t.Fatalf("vision_prompt: %q", prompt)
+	}
+	if got["vision_response"] != "图中是登录页" {
+		t.Fatalf("vision_response: %v", got["vision_response"])
 	}
 }

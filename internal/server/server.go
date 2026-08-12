@@ -119,7 +119,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// vision 预处理：最新 run 图片经 vision 上游单独解析为文本后替换回请求，
 		// 再走 main（vision 只收图、main 只收文本）。
 		vpStart := time.Now()
-		body, err = s.preprocessVision(r.Context(), cfg, format, body)
+		body, err = s.preprocessVision(r.Context(), cfg, format, body, rec)
 		decision.VisionPreprocess = true
 		decision.VisionPreprocessMs = time.Since(vpStart).Milliseconds()
 		if err != nil {

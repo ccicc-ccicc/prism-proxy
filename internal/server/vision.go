@@ -11,6 +11,7 @@ import (
 
 	"prism-proxy/internal/config"
 	"prism-proxy/internal/convert"
+	"prism-proxy/internal/trafficlog"
 )
 
 // vision 预处理错误分类（与 forward 上游失败语义一致）：
@@ -29,7 +30,8 @@ const visionDescribePrompt = "请依次详细描述每一张图片的内容：�
 // （只含图 + prompt，绝不带历史）→ 上游单独解析 → 解析文本填回哨兵占位。
 // imgs 为空（无 base64 图，如 URL 降级）时跳过 vision 调用，直接返回
 // ExtractLatestImages 的 out（URL 图已在提取阶段降级为 [image omitted]）。
-func (s *Server) preprocessVision(ctx context.Context, cfg *config.Config, format string, body []byte) ([]byte, error) {
+// rec 非 nil 时记录子请求信息（prompt/图数/图总字节/解析响应）进主请求内容日志。
+func (s *Server) preprocessVision(ctx context.Context, cfg *config.Config, format string, body []byte, rec *trafficlog.Recorder) ([]byte, error) {
 	imgs, userText, out, err := convert.ExtractLatestImages(format, body)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", errVisionPreprocess, err)
@@ -44,6 +46,15 @@ func (s *Server) preprocessVision(ctx context.Context, cfg *config.Config, forma
 	visionReq, err := buildVisionRequest(vision, imgs, userText)
 	if err != nil {
 		return nil, fmt.Errorf("%w: build vision request: %v", errVisionPreprocess, err)
+	}
+	totalBytes := 0
+	for _, img := range imgs {
+		totalBytes += len(img.Data)
+	}
+	prompt := visionPrompt(userText)
+	if rec != nil {
+		// 调用前先落 prompt/图元数据：上游失败时 response 保持空，便于区分
+		rec.SetVisionPreprocess(prompt, len(imgs), totalBytes, "")
 	}
 	resp, err := s.client.Do(ctx, vision, visionReq, false)
 	if err != nil {
@@ -61,17 +72,26 @@ func (s *Server) preprocessVision(ctx context.Context, cfg *config.Config, forma
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", errVisionPreprocess, err)
 	}
+	if rec != nil {
+		rec.SetVisionPreprocess(prompt, len(imgs), totalBytes, text)
+	}
 	return convert.FillImageTexts(format, out, []string{text})
+}
+
+// visionPrompt 拼接解析指令：固定指令 + 用户上下文（run 内有用户文本时）。
+func visionPrompt(userText string) string {
+	prompt := visionDescribePrompt
+	if userText != "" {
+		prompt += "结合用户问题「" + userText + "」，重点描述图中相关内容。"
+	}
+	return prompt
 }
 
 // buildVisionRequest 构造 vision 预处理请求（非流式）：图片块在前、prompt 文本块在后。
 // claude 格式 max_tokens 必设（MessagesRequest 无 omitempty，不设序列化 0 会被
 // 上游 400 拒绝）；openai 格式图片用 data URL part。
 func buildVisionRequest(vision *config.UpstreamConfig, imgs []convert.ImageData, userText string) ([]byte, error) {
-	prompt := visionDescribePrompt
-	if userText != "" {
-		prompt += "结合用户问题「" + userText + "」，重点描述图中相关内容。"
-	}
+	prompt := visionPrompt(userText)
 	content := make([]any, 0, len(imgs)+1)
 	if vision.Format == "claude" {
 		for _, img := range imgs {
