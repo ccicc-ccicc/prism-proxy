@@ -115,6 +115,27 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, format, http.StatusBadRequest, "invalid request: "+err.Error(), rec)
 		return
 	}
+	if decision.NeedPreprocess {
+		// vision 预处理：最新 run 图片经 vision 上游单独解析为文本后替换回请求，
+		// 再走 main（vision 只收图、main 只收文本）。
+		vpStart := time.Now()
+		body, err = s.preprocessVision(r.Context(), cfg, format, body)
+		decision.VisionPreprocess = true
+		decision.VisionPreprocessMs = time.Since(vpStart).Milliseconds()
+		if err != nil {
+			// 请求侧（提取/构造/解析）失败 → 400；vision 上游失败 → 502
+			status := http.StatusBadRequest
+			if errors.Is(err, errVisionUpstream) {
+				status = http.StatusBadGateway
+			}
+			if rec != nil {
+				rec.SetError(err)
+				rec.SetStatus(status)
+			}
+			writeError(w, format, status, err.Error(), rec)
+			return
+		}
+	}
 	if decision.Upstream == "main" && cfg.AutoSwitchVision {
 		var sanitized bool
 		body, sanitized, err = route.SanitizeHistoryImages(format, body)
@@ -276,9 +297,13 @@ func (s *Server) log(start time.Time, format string, d route.Decision, up config
 	if rec != nil {
 		attrs = append(attrs, "request_id", rec.RequestID())
 	}
-	if d.HasImage && !d.VisionSwitch {
-		// spec §7：检测到图片但未切换（开关关/无 vision 上游）时记录
+	if d.HasImage && !d.VisionSwitch && !d.NeedPreprocess {
+		// spec §7：检测到图片但未切换（开关关/无 vision 上游）时记录；
+		// 预处理请求已输出 vision_preprocess 标记，避免冗余
 		attrs = append(attrs, "image_detected", true)
+	}
+	if d.VisionPreprocess {
+		attrs = append(attrs, "vision_preprocess", true, "vision_preprocess_ms", d.VisionPreprocessMs)
 	}
 	if d.ImagesSanitized {
 		attrs = append(attrs, "images_sanitized", true)

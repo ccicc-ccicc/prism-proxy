@@ -17,6 +17,10 @@ logging:
 auto_switch_vision: true     # 带图请求自动切换到 vision 上游；false = 永不切换
                              # true 时必须有 vision 上游，否则启动 fail-fast 报错
 
+vision_preprocess: false     # vision 预处理模式（可选）：true 时最新轮次图片经 vision 上游单独
+                             # 解析为文本后替换进请求再走 main（vision 只收图、main 只收文本，
+                             # 避免小窗口 vision 模型上下文超限）；false = 整请求切 vision
+
 # 主上游：默认转发目标（所有文本/非切换请求）
 main:
   baseurl: "https://api.openai.com/v1"   # 上游 base URL（不含 /chat/completions 或 /messages）

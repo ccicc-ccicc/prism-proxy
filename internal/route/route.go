@@ -14,12 +14,14 @@ const (
 )
 
 type Decision struct {
-	Upstream        string
-	Model           string
-	VisionSwitch    bool
-	HasImage        bool // 入站请求末尾用户侧 run 是否含图（spec §7：命中但不切换时日志标记 image_detected）
-	ImagesSanitized bool // 历史图片已被替换为文本标记（仅走 main 且 auto_switch_vision 时可能）
-	NeedPreprocess  bool // vision 预处理模式：最新 run 含图，需 vision 解析后走 main
+	Upstream           string
+	Model              string
+	VisionSwitch       bool
+	HasImage           bool  // 入站请求末尾用户侧 run 是否含图（spec §7：命中但不切换时日志标记 image_detected）
+	ImagesSanitized    bool  // 历史图片已被替换为文本标记（仅走 main 且 auto_switch_vision 时可能）
+	NeedPreprocess     bool  // vision 预处理模式：最新 run 含图，需 vision 解析后走 main
+	VisionPreprocess   bool  // 本次请求实际执行了 vision 预处理（日志标记）
+	VisionPreprocessMs int64 // 预处理耗时毫秒数（日志标记）
 }
 
 // Decide 按 spec §4 两条规则决策，忽略请求模型名。
