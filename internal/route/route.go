@@ -19,6 +19,7 @@ type Decision struct {
 	VisionSwitch    bool
 	HasImage        bool // 入站请求末尾用户侧 run 是否含图（spec §7：命中但不切换时日志标记 image_detected）
 	ImagesSanitized bool // 历史图片已被替换为文本标记（仅走 main 且 auto_switch_vision 时可能）
+	NeedPreprocess  bool // vision 预处理模式：最新 run 含图，需 vision 解析后走 main
 }
 
 // Decide 按 spec §4 两条规则决策，忽略请求模型名。
@@ -29,6 +30,10 @@ func Decide(cfg *config.Config, format string, body []byte) (Decision, error) {
 	}
 	if hasImage && cfg.AutoSwitchVision {
 		if vision, ok := cfg.Vision(); ok {
+			if cfg.VisionPreprocess {
+				// 预处理模式：最新图经 vision 解析后走 main（不切上游）
+				return Decision{Upstream: "main", Model: cfg.Main().Model, HasImage: true, NeedPreprocess: true}, nil
+			}
 			return Decision{Upstream: "vision", Model: vision.Model, VisionSwitch: true, HasImage: true}, nil
 		}
 	}
