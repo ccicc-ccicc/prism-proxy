@@ -382,3 +382,99 @@ func TestO2CStream_TextContinuationNoSplit(t *testing.T) {
 		t.Fatalf("continuation delta: %+v", ev)
 	}
 }
+
+// reasoning → text：thinking idx 0 → text idx 1，索引连续
+func TestO2CStream_ReasoningThenText(t *testing.T) {
+	s := NewO2CStream()
+	_, _ = s.Write([]byte(`{"choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}`))
+	out, _ := s.Write([]byte(`{"choices":[{"index":0,"delta":{"reasoning_content":"We"},"finish_reason":null}]}`))
+	if len(out) != 2 {
+		t.Fatalf("reasoning start frames: %d (%s)", len(out), out)
+	}
+	start := decodeEvent(t, out[0])
+	if start.ContentBlock == nil || start.ContentBlock.Type != "thinking" || start.Index != 0 {
+		t.Fatalf("thinking block must be index 0: %+v", start)
+	}
+	delta := decodeEvent(t, out[1])
+	if delta.Delta == nil || delta.Delta.Type != "thinking_delta" || delta.Delta.Thinking != "We" {
+		t.Fatalf("thinking delta: %+v", delta.Delta)
+	}
+	// text 到达 → 关 thinking，开 text idx 1
+	out, _ = s.Write([]byte(`{"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}`))
+	if len(out) != 3 {
+		t.Fatalf("reasoning-then-text frames: %d (%s)", len(out), out)
+	}
+	if !strings.Contains(string(out[0]), "content_block_stop") {
+		t.Fatalf("thinking must close: %s", out[0])
+	}
+	textStart := decodeEvent(t, out[1])
+	if textStart.ContentBlock == nil || textStart.ContentBlock.Type != "text" || textStart.Index != 1 {
+		t.Fatalf("text block must be index 1: %+v", textStart)
+	}
+}
+
+// 纯 reasoning + length finish：thinking 关闭 + message_delta{max_tokens}，无 text 块
+func TestO2CStream_ReasoningOnlyLengthFinish(t *testing.T) {
+	s := NewO2CStream()
+	_, _ = s.Write([]byte(`{"choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}`))
+	_, _ = s.Write([]byte(`{"choices":[{"index":0,"delta":{"reasoning_content":"deep"},"finish_reason":null}]}`))
+	out, _ := s.Write([]byte(`{"choices":[{"index":0,"delta":{},"finish_reason":"length"}]}`))
+	if len(out) != 2 || !strings.Contains(string(out[0]), "content_block_stop") {
+		t.Fatalf("thinking must close before message_delta: %s", out)
+	}
+	if !strings.Contains(string(out[1]), "\"stop_reason\":\"max_tokens\"") {
+		t.Fatalf("finish: %s", out[1])
+	}
+}
+
+// Finish() 时 thinking 未闭合 → content_block_stop + message_stop
+func TestO2CStream_FinishClosesThinking(t *testing.T) {
+	s := NewO2CStream()
+	_, _ = s.Write([]byte(`{"choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}`))
+	_, _ = s.Write([]byte(`{"choices":[{"index":0,"delta":{"reasoning_content":"deep"},"finish_reason":null}]}`))
+	fin := s.Finish()
+	if len(fin) != 2 || !strings.Contains(string(fin[0]), "content_block_stop") || !strings.Contains(string(fin[1]), "message_stop") {
+		t.Fatalf("finish must close thinking: %s", fin)
+	}
+}
+
+// 多 chunk 增量 → 连续 thinking_delta 不拆块
+func TestO2CStream_ReasoningContinuationNoSplit(t *testing.T) {
+	s := NewO2CStream()
+	_, _ = s.Write([]byte(`{"choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}`))
+	_, _ = s.Write([]byte(`{"choices":[{"index":0,"delta":{"reasoning_content":"a"},"finish_reason":null}]}`))
+	out, _ := s.Write([]byte(`{"choices":[{"index":0,"delta":{"reasoning_content":"b"},"finish_reason":null}]}`))
+	if len(out) != 1 {
+		t.Fatalf("continuation frames: %d (%s)", len(out), out)
+	}
+	ev := decodeEvent(t, out[0])
+	if ev.Index != 0 || ev.Delta == nil || ev.Delta.Type != "thinking_delta" || ev.Delta.Thinking != "b" {
+		t.Fatalf("continuation delta: %+v", ev)
+	}
+}
+
+// reasoning → tool_calls：thinking idx 0 → tool_use idx 1
+func TestO2CStream_ReasoningThenTool(t *testing.T) {
+	s := NewO2CStream()
+	_, _ = s.Write([]byte(`{"choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}`))
+	_, _ = s.Write([]byte(`{"choices":[{"index":0,"delta":{"reasoning_content":"think"},"finish_reason":null}]}`))
+	out, _ := s.Write([]byte(`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"c1","type":"function","function":{"name":"f","arguments":""}}]},"finish_reason":null}]}`))
+	if len(out) != 2 || !strings.Contains(string(out[0]), "content_block_stop") {
+		t.Fatalf("thinking must close before tool start: %s", out)
+	}
+	toolStart := decodeEvent(t, out[1])
+	if toolStart.ContentBlock == nil || toolStart.ContentBlock.Type != "tool_use" || toolStart.Index != 1 {
+		t.Fatalf("tool_use must be index 1 after thinking: %+v", toolStart)
+	}
+}
+
+// 同一 chunk reasoning + content（异常防御）：reasoning 先、text 后
+func TestO2CStream_ReasoningAndContentSameChunk(t *testing.T) {
+	s := NewO2CStream()
+	_, _ = s.Write([]byte(`{"choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}`))
+	out, _ := s.Write([]byte(`{"choices":[{"index":0,"delta":{"reasoning_content":"r","content":"c"},"finish_reason":null}]}`))
+	// [start(thinking,0), thinking_delta, stop(0), start(text,1), text_delta]
+	if len(out) != 5 {
+		t.Fatalf("same-chunk frames: %d (%s)", len(out), out)
+	}
+}

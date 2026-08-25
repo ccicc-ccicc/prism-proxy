@@ -3,6 +3,7 @@ package convert
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 )
 
 // O2CStream 将 OpenAI SSE chunk JSON 转换为 Claude SSE 帧。
@@ -21,14 +22,15 @@ import (
 //   - finish_reason 到达时先关闭打开的块，再发 message_delta；
 //   - Finish() 幂等：仅首次调用产出帧。
 type O2CStream struct {
-	id       string
-	model    string
-	started  bool
-	blockIdx int // Claude content_block 全局索引（text=0、tool_use=1…）
-	inText   bool
-	inTool   bool
-	sentStop bool
-	done     bool
+	id         string
+	model      string
+	started    bool
+	blockIdx   int // Claude content_block 全局索引（text=0、tool_use=1…）
+	inText     bool
+	inTool     bool
+	inThinking bool
+	sentStop   bool
+	done       bool
 }
 
 func NewO2CStream() *O2CStream { return NewO2CStreamWithModel("") }
@@ -60,14 +62,28 @@ func (s *O2CStream) Write(data []byte) ([][]byte, error) {
 		return frames, nil
 	}
 	delta := chunk.Choices[0].Delta
-	if text, ok := delta.Content.(string); ok && text != "" {
-		if s.inTool {
-			// 块切换（tool_use → text）：先关当前块并递增 index
+	// reasoning_content 逐 chunk 增量下发（deepseek 系行为）；若上游改为
+	// 全量下发，需先拼接再发射，避免重复拼接。
+	if rc := strings.TrimSpace(delta.ReasoningContent); rc != "" {
+		if s.inText || s.inTool {
 			frames = append(frames, s.frame(EventContentBlockStop, StreamEvent{Index: s.blockIdx}))
 			s.inText, s.inTool = false, false
 			s.blockIdx++
 		}
-		if !s.inText {
+		if !s.inThinking {
+			s.inThinking = true
+			frames = append(frames, s.frame(EventContentBlockStart, StreamEvent{Index: s.blockIdx, ContentBlock: &ClaudeBlock{Type: "thinking"}}))
+		}
+		frames = append(frames, s.frame(EventContentBlockDelta, StreamEvent{Index: s.blockIdx, Delta: &ClaudeDelta{Type: "thinking_delta", Thinking: rc}}))
+	}
+	if text, ok := delta.Content.(string); ok && text != "" {
+		if s.inTool || s.inThinking {
+			// 块切换（tool_use/thinking → text）：先关当前块并递增 index
+			frames = append(frames, s.frame(EventContentBlockStop, StreamEvent{Index: s.blockIdx}))
+			s.inText, s.inTool, s.inThinking = false, false, false
+			s.blockIdx++
+		}
+		if !s.inText && !s.inTool && !s.inThinking {
 			s.inText = true
 			frames = append(frames, s.frame(EventContentBlockStart, StreamEvent{Index: s.blockIdx, ContentBlock: &ClaudeBlock{Type: "text"}}))
 		}
@@ -75,9 +91,9 @@ func (s *O2CStream) Write(data []byte) ([][]byte, error) {
 	}
 	for _, tc := range delta.ToolCalls {
 		if tc.ID != "" && tc.Function.Name != "" {
-			if s.inText || s.inTool {
+			if s.inText || s.inTool || s.inThinking {
 				frames = append(frames, s.frame(EventContentBlockStop, StreamEvent{Index: s.blockIdx}))
-				s.inText, s.inTool = false, false
+				s.inText, s.inTool, s.inThinking = false, false, false
 				s.blockIdx++
 			}
 			s.inTool = true
@@ -93,9 +109,9 @@ func (s *O2CStream) Write(data []byte) ([][]byte, error) {
 	}
 	if fr := chunk.Choices[0].FinishReason; fr != nil && !s.sentStop {
 		s.sentStop = true
-		if s.inText || s.inTool {
+		if s.inText || s.inTool || s.inThinking {
 			frames = append(frames, s.frame(EventContentBlockStop, StreamEvent{Index: s.blockIdx}))
-			s.inText, s.inTool = false, false
+			s.inText, s.inTool, s.inThinking = false, false, false
 		}
 		// Anthropic 真实 message_delta：stop_reason 嵌套在 delta 内
 		// （{"delta":{"stop_reason":"end_turn"}}），usage 可同帧携带
@@ -116,8 +132,8 @@ func (s *O2CStream) Finish() [][]byte {
 		return nil
 	}
 	s.done = true
-	if s.inText || s.inTool {
-		s.inText, s.inTool = false, false
+	if s.inText || s.inTool || s.inThinking {
+		s.inText, s.inTool, s.inThinking = false, false, false
 		return [][]byte{s.frame(EventContentBlockStop, StreamEvent{Index: s.blockIdx}), s.frame(EventMessageStop, StreamEvent{})}
 	}
 	return [][]byte{s.frame(EventMessageStop, StreamEvent{})}
