@@ -10,6 +10,13 @@ func OpenAIResponseToClaude(resp *ChatCompletionResponse, id string) (*MessagesR
 	}
 	out := &MessagesResponse{ID: id, Type: "message", Role: "assistant", Model: resp.Model}
 	var blocks []ClaudeBlock
+	if len(resp.Choices) > 0 {
+		// thinking 只在最前且仅一次（取自 Choices[0]，与 finish_reason/usage 的
+		// 约定一致）。usage.reasoning_tokens 故意忽略：Claude usage 无对应字段。
+		if rc := strings.TrimSpace(resp.Choices[0].Message.ReasoningContent); rc != "" {
+			blocks = append(blocks, ClaudeBlock{Type: "thinking", Thinking: rc})
+		}
+	}
 	for _, ch := range resp.Choices {
 		if s := contentString(ch.Message.Content); s != "" {
 			blocks = append(blocks, ClaudeBlock{Type: "text", Text: s})

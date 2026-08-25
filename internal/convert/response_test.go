@@ -1,6 +1,7 @@
 package convert
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -89,5 +90,76 @@ func TestClaudeResponseToOpenAI_NilImageSource(t *testing.T) {
 	}
 	if out.Choices[0].Message.Content != "answer" {
 		t.Fatalf("content: %v", out.Choices[0].Message.Content)
+	}
+}
+
+func TestOpenAIResponseToClaude_ReasoningMapped(t *testing.T) {
+	resp := &ChatCompletionResponse{
+		Choices: []ResponseChoice{{Message: ChatMessage{
+			Content:          "hi",
+			ReasoningContent: "think step by step",
+			ToolCalls:        []ToolCall{{ID: "call_1", Type: "function", Function: ToolCallFunction{Name: "f", Arguments: `{"x":1}`}}},
+		}, FinishReason: "tool_calls"}},
+	}
+	out, err := OpenAIResponseToClaude(resp, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Content) != 3 {
+		t.Fatalf("want 3 blocks, got %d: %+v", len(out.Content), out.Content)
+	}
+	if out.Content[0].Type != "thinking" || out.Content[0].Thinking != "think step by step" {
+		t.Fatalf("first block must be thinking: %+v", out.Content[0])
+	}
+	if out.Content[1].Type != "text" || out.Content[1].Text != "hi" {
+		t.Fatalf("second block must be text: %+v", out.Content[1])
+	}
+	if out.Content[2].Type != "tool_use" {
+		t.Fatalf("third block must be tool_use: %+v", out.Content[2])
+	}
+}
+
+func TestOpenAIResponseToClaude_ReasoningOnly(t *testing.T) {
+	resp := &ChatCompletionResponse{Choices: []ResponseChoice{{Message: ChatMessage{Content: "", ReasoningContent: "only thinking"}}}}
+	out, err := OpenAIResponseToClaude(resp, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Content) != 1 || out.Content[0].Type != "thinking" || out.Content[0].Thinking != "only thinking" {
+		t.Fatalf("want only thinking: %+v", out.Content)
+	}
+}
+
+// Important 1: 多 choice 防御——thinking 仅一次且在最前（取自 Choices[0]）
+func TestOpenAIResponseToClaude_MultiChoiceThinkingOnce(t *testing.T) {
+	resp := &ChatCompletionResponse{
+		Choices: []ResponseChoice{
+			{Message: ChatMessage{Content: "a", ReasoningContent: "r1"}},
+			{Message: ChatMessage{Content: "b", ReasoningContent: "r2"}},
+		},
+	}
+	out, err := OpenAIResponseToClaude(resp, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Content) != 3 {
+		t.Fatalf("want 3 blocks: %+v", out.Content)
+	}
+	if out.Content[0].Type != "thinking" || out.Content[0].Thinking != "r1" {
+		t.Fatalf("thinking once first: %+v", out.Content[0])
+	}
+	if out.Content[1].Type != "text" || out.Content[2].Type != "text" {
+		t.Fatalf("texts follow: %+v", out.Content)
+	}
+}
+
+// 回归：不含 reasoning 的 ChatMessage 序列化不得带 reasoning_content 键（C2O 出站安全）
+func TestChatMessageMarshalNoReasoningContent(t *testing.T) {
+	b, err := json.Marshal(ChatMessage{Role: "assistant", Content: "hi"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(b), "reasoning_content") {
+		t.Fatalf("unexpected reasoning_content key: %s", b)
 	}
 }
