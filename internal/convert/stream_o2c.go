@@ -16,7 +16,7 @@ import (
 //   - text 块内所有内容 delta 连续发射，不做逐 delta 的 stop 拆分；
 //   - 开始任何新块（text 或 tool_use）前，若已有块打开，先发该块的
 //     content_block_stop 并全局 blockIdx++，保证 Claude content_block index
-//     从 0 连续（text=0、tool_use=1…；纯 tool 流第一块为 0）；
+//     从 0 连续（thinking=0、text=1、tool_use=2…；纯 tool 流第一块为 0）；
 //   - tool_calls start chunk 自带的 arguments 在 block start 后作为
 //     input_json_delta 发射；
 //   - finish_reason 到达时先关闭打开的块，再发 message_delta；
@@ -25,7 +25,7 @@ type O2CStream struct {
 	id         string
 	model      string
 	started    bool
-	blockIdx   int // Claude content_block 全局索引（text=0、tool_use=1…）
+	blockIdx   int // Claude content_block 全局索引（thinking=0、text=1、tool_use=2…）
 	inText     bool
 	inTool     bool
 	inThinking bool
@@ -63,13 +63,12 @@ func (s *O2CStream) Write(data []byte) ([][]byte, error) {
 	}
 	delta := chunk.Choices[0].Delta
 	// reasoning_content 逐 chunk 增量下发（deepseek 系行为）；若上游改为
-	// 全量下发，需先拼接再发射，避免重复拼接。
-	if rc := strings.TrimSpace(delta.ReasoningContent); rc != "" {
-		if s.inText || s.inTool {
-			frames = append(frames, s.frame(EventContentBlockStop, StreamEvent{Index: s.blockIdx}))
-			s.inText, s.inTool = false, false
-			s.blockIdx++
-		}
+	// 全量下发，需先拼接再发射，避免重复拼接。TrimSpace 仅作空判断，
+	// 发射保留原文（不裁剪词间空格，与 content 分支对称）。
+	// thinking 协议上必须是 content 首个且唯一块：text/tool 打开后到达的
+	// reasoning 增量直接丢弃（不发射、不开块）——真实上游不会触发，防御路径。
+	// thinking_delta 不带 signature 属已知缺口（尽力转发，spec 2026-08-25 记录）。
+	if rc := delta.ReasoningContent; strings.TrimSpace(rc) != "" && !s.inText && !s.inTool {
 		if !s.inThinking {
 			s.inThinking = true
 			frames = append(frames, s.frame(EventContentBlockStart, StreamEvent{Index: s.blockIdx, ContentBlock: &ClaudeBlock{Type: "thinking"}}))

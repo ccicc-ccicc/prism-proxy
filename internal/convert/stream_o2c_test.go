@@ -477,4 +477,72 @@ func TestO2CStream_ReasoningAndContentSameChunk(t *testing.T) {
 	if len(out) != 5 {
 		t.Fatalf("same-chunk frames: %d (%s)", len(out), out)
 	}
+	start := decodeEvent(t, out[0])
+	if start.ContentBlock == nil || start.ContentBlock.Type != "thinking" || start.Index != 0 {
+		t.Fatalf("frame 0 must be thinking start idx 0: %+v", start)
+	}
+	thinkDelta := decodeEvent(t, out[1])
+	if thinkDelta.Delta == nil || thinkDelta.Delta.Type != "thinking_delta" || thinkDelta.Delta.Thinking != "r" {
+		t.Fatalf("frame 1 must be thinking_delta: %+v", thinkDelta.Delta)
+	}
+	if !strings.Contains(string(out[2]), "content_block_stop") {
+		t.Fatalf("frame 2 must be thinking stop: %s", out[2])
+	}
+	textStart := decodeEvent(t, out[3])
+	if textStart.ContentBlock == nil || textStart.ContentBlock.Type != "text" || textStart.Index != 1 {
+		t.Fatalf("frame 3 must be text start idx 1: %+v", textStart)
+	}
+	textDelta := decodeEvent(t, out[4])
+	if textDelta.Delta == nil || textDelta.Delta.Type != "text_delta" || textDelta.Delta.Text != "c" {
+		t.Fatalf("frame 4 must be text_delta: %+v", textDelta.Delta)
+	}
+}
+
+// I1: reasoning 增量保留原文——TrimSpace 仅作空判断，不裁剪词间/前导空格
+func TestO2CStream_ReasoningKeepsInnerSpaces(t *testing.T) {
+	s := NewO2CStream()
+	_, _ = s.Write([]byte(`{"choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}`))
+	out, _ := s.Write([]byte(`{"choices":[{"index":0,"delta":{"reasoning_content":"We"},"finish_reason":null}]}`))
+	if len(out) != 2 {
+		t.Fatalf("first thinking chunk frames: %d (%s)", len(out), out)
+	}
+	delta := decodeEvent(t, out[1])
+	if delta.Delta == nil || delta.Delta.Thinking != "We" {
+		t.Fatalf("first delta must carry original text: %+v", delta.Delta)
+	}
+	for _, tok := range []string{" think", " about", " it"} {
+		out, _ := s.Write([]byte(`{"choices":[{"index":0,"delta":{"reasoning_content":"` + tok + `"},"finish_reason":null}]}`))
+		if len(out) != 1 {
+			t.Fatalf("chunk %q frames: %d (%s)", tok, len(out), out)
+		}
+		ev := decodeEvent(t, out[0])
+		if ev.Delta == nil || ev.Delta.Thinking != tok {
+			t.Fatalf("delta must carry original %q: %+v", tok, ev.Delta)
+		}
+	}
+}
+
+// I2: text 块打开后到达的 reasoning 增量丢弃（thinking 必须首个且唯一，防御路径）
+func TestO2CStream_ReasoningAfterTextDropped(t *testing.T) {
+	s := NewO2CStream()
+	_, _ = s.Write([]byte(`{"choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}`))
+	_, _ = s.Write([]byte(`{"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}`))
+	out, _ := s.Write([]byte(`{"choices":[{"index":0,"delta":{"reasoning_content":"late"},"finish_reason":null}]}`))
+	if len(out) != 0 {
+		t.Fatalf("late reasoning must be dropped, got %d frames: %s", len(out), out)
+	}
+}
+
+// reasoning 流 Finish() 幂等：首次关 thinking + message_stop，第二次零帧
+func TestO2CStream_ReasoningFinishIdempotent(t *testing.T) {
+	s := NewO2CStream()
+	_, _ = s.Write([]byte(`{"choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}`))
+	_, _ = s.Write([]byte(`{"choices":[{"index":0,"delta":{"reasoning_content":"r"},"finish_reason":null}]}`))
+	first := s.Finish()
+	if len(first) != 2 || !strings.Contains(string(first[0]), "content_block_stop") || !strings.Contains(string(first[1]), "message_stop") {
+		t.Fatalf("first Finish must close thinking: %s", first)
+	}
+	if second := s.Finish(); len(second) != 0 {
+		t.Fatalf("second Finish must emit nothing, got %d frames", len(second))
+	}
 }
