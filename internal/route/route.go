@@ -3,6 +3,7 @@ package route
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"prism-proxy/internal/config"
 	"prism-proxy/internal/convert"
@@ -320,4 +321,70 @@ func msgHasText(content any) bool {
 		}
 	}
 	return false
+}
+
+// StripToolReferences 把 user 消息 tool_result 内嵌的 tool_reference 块转为
+// 字符串描述（"tools: A, B"）。tool_reference 是 Claude Code 2.1 ToolSearch
+// 产物；aigw/DeepSeek 兼容层 serde 不认识该类型，转换时字段丢失即 400
+// （missing field tool_name）。仅处理 claude 格式；无 tool_reference → no-op。
+func StripToolReferences(format string, body []byte) ([]byte, bool, error) {
+	if format != "claude" {
+		return body, false, nil
+	}
+	var root map[string]any
+	if err := json.Unmarshal(body, &root); err != nil {
+		return nil, false, fmt.Errorf("parse %s request: %w", format, err)
+	}
+	msgs, ok := root["messages"].([]any)
+	if !ok {
+		return body, false, nil
+	}
+	changed := false
+	for _, m := range msgs {
+		mm, ok := m.(map[string]any)
+		if !ok {
+			continue
+		}
+		content, ok := mm["content"].([]any)
+		if !ok {
+			continue
+		}
+		for _, b := range content {
+			bm, ok := b.(map[string]any)
+			if !ok || bm["type"] != "tool_result" {
+				continue
+			}
+			inner, ok := bm["content"].([]any)
+			if !ok {
+				continue
+			}
+			hasRef := false
+			var names []string
+			var kept []any
+			for _, el := range inner {
+				em, ok := el.(map[string]any)
+				if ok && em["type"] == "tool_reference" {
+					hasRef = true
+					if n, ok := em["tool_name"].(string); ok && n != "" {
+						names = append(names, n)
+					}
+					continue
+				}
+				kept = append(kept, el)
+			}
+			if !hasRef {
+				continue
+			}
+			bm["content"] = "tools: " + strings.Join(names, ", ")
+			changed = true
+		}
+	}
+	if !changed {
+		return body, false, nil
+	}
+	out, err := json.Marshal(root)
+	if err != nil {
+		return nil, false, fmt.Errorf("marshal %s request: %w", format, err)
+	}
+	return out, true, nil
 }

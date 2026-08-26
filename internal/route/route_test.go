@@ -509,3 +509,43 @@ func TestEnsureThinkingBlocks(t *testing.T) {
 		t.Fatal("second run body not byte-identical")
 	}
 }
+
+// toolReferenceBody: Claude Code 2.1 ToolSearch 产物的 tool_reference 块。
+const toolReferenceBody = `{"model":"x","messages":[
+	{"role":"user","content":"查工具"},
+	{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"ToolSearch","input":{}}]},
+	{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":[{"tool_name":"TeamCreate","type":"tool_reference"},{"tool_name":"SendMessage","type":"tool_reference"}]},{"type":"text","text":"Tool loaded."}]}
+]}`
+
+func TestStripToolReferences(t *testing.T) {
+	out, changed, err := StripToolReferences("claude", []byte(toolReferenceBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changed {
+		t.Fatal("expected change")
+	}
+	var m map[string]any
+	if err := json.Unmarshal(out, &m); err != nil {
+		t.Fatal(err)
+	}
+	blocks := m["messages"].([]any)[2].(map[string]any)["content"].([]any)
+	tr := blocks[0].(map[string]any)
+	content, ok := tr["content"].(string)
+	if !ok || !strings.Contains(content, "TeamCreate") {
+		t.Fatalf("tool_reference must become string desc: %v", tr)
+	}
+	if strings.Contains(content, "tool_reference") {
+		t.Fatalf("must not keep tool_reference type: %s", content)
+	}
+	// text 块保持原样
+	if blocks[1].(map[string]any)["type"] != "text" {
+		t.Fatalf("text block must remain: %v", blocks[1])
+	}
+	// 无 tool_reference → no-op 逐字节
+	plain := []byte(`{"model":"x","messages":[{"role":"user","content":"hi"}]}`)
+	out2, changed2, err := StripToolReferences("claude", plain)
+	if err != nil || changed2 || string(out2) != string(plain) {
+		t.Fatalf("no-op: %v %v %s", changed2, err, out2)
+	}
+}

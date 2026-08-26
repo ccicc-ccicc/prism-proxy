@@ -46,6 +46,14 @@ func (s *Server) relay(w http.ResponseWriter, r *http.Request, cfg *config.Confi
 				return err
 			}
 		}
+		if format == "claude" {
+			// Claude Code 2.1 ToolSearch 的 tool_reference 块：aigw/DeepSeek
+			// 兼容层 serde 不认识该类型（转字符串描述，否则 400）
+			outbound, _, err = route.StripToolReferences("claude", outbound)
+			if err != nil {
+				return err
+			}
+		}
 		return s.forward(w, r, &up, outbound, format, d, rec)
 	}
 	// 交叉格式：转换请求
