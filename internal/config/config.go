@@ -13,6 +13,10 @@ import (
 type Config struct {
 	Server           ServerConfig              `yaml:"server"`
 	AutoSwitchVision bool                      `yaml:"auto_switch_vision"`
+	// VisionPreprocess vision 预处理模式：true 时最新轮次图片经 vision 上游单独
+	// 解析为文本后替换进请求再走 main（vision 只收图、main 只收文本，避免
+	// 小窗口 vision 模型上下文超限）；false = 现有行为（整请求切 vision）
+	VisionPreprocess bool                      `yaml:"vision_preprocess"`
 	Logging          LoggingConfig             `yaml:"logging"`
 	Upstreams        map[string]UpstreamConfig `yaml:",inline"`
 }

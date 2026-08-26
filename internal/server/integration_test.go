@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -8,8 +9,10 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"prism-proxy/internal/config"
+	"prism-proxy/internal/trafficlog"
 	"prism-proxy/internal/upstream"
 )
 
@@ -493,5 +496,491 @@ func TestThinkingCompat_DisabledPassthrough(t *testing.T) {
 	if resp.StatusCode != 200 {
 		body, _ := io.ReadAll(resp.Body)
 		t.Fatalf("status: %d body: %s", resp.StatusCode, body)
+	}
+}
+
+// ---------- Vision 预处理（Task 2）----------
+
+// visionPreprocessReq 是 vision 预处理测试入站请求：末尾连续两条 user 消息构成
+// 最新 run（"hi" 为 run 内用户文本，第二条含 base64 图）。
+const visionPreprocessReq = `{"model":"x","thinking":{"type":"adaptive"},"messages":[
+	{"role":"user","content":"hi"},
+	{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}]}
+]}`
+
+// newVisionPreprocessProxy 构造 vision 预处理测试代理：AutoSwitchVision 恒开，
+// vision/main 独立 mock（独立 BaseURL），按参数指定上游格式与预处理开关。
+func newVisionPreprocessProxy(t *testing.T, visionSrv, mainSrv *httptest.Server, visionFormat, mainFormat string, preprocess bool) *httptest.Server {
+	t.Helper()
+	cfg := &config.Config{
+		AutoSwitchVision: true,
+		VisionPreprocess: preprocess,
+		Upstreams: map[string]config.UpstreamConfig{
+			"main":   {BaseURL: mainSrv.URL + "/v1", APIKey: "sk", Format: mainFormat, Model: "main-m"},
+			"vision": {BaseURL: visionSrv.URL + "/v1", APIKey: "sk", Format: visionFormat, Model: "vision-m"},
+		},
+	}
+	srv := NewWithConfig(cfg, upstream.NewClient(), slog.Default())
+	ts := httptest.NewServer(srv)
+	t.Cleanup(ts.Close)
+	return ts
+}
+
+// postMessages 向代理发送 claude 格式请求并返回响应体。
+func postMessages(t *testing.T, url, body string) (*http.Response, []byte) {
+	t.Helper()
+	resp, err := http.Post(url, "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(resp.Body)
+	return resp, data
+}
+
+// recvBody 等待 mock 收到请求体；5 秒超时防挂起（mock 未被调用时快速失败）。
+func recvBody(t *testing.T, ch <-chan string) string {
+	t.Helper()
+	select {
+	case b := <-ch:
+		return b
+	case <-time.After(5 * time.Second):
+		t.Fatal("upstream mock not called")
+		return ""
+	}
+}
+
+// assertNoImageBlocks 断言 body 中所有消息 content 顶层块均非 image/image_url
+// 且不含 source（即无任何图片块残留）。
+func assertNoImageBlocks(t *testing.T, body string) {
+	t.Helper()
+	var m map[string]any
+	if err := json.Unmarshal([]byte(body), &m); err != nil {
+		t.Fatalf("unmarshal: %v body: %s", err, body)
+	}
+	msgs, _ := m["messages"].([]any)
+	for _, msg := range msgs {
+		mm, _ := msg.(map[string]any)
+		content, _ := mm["content"].([]any)
+		for _, p := range content {
+			pm, _ := p.(map[string]any)
+			tpe, _ := pm["type"].(string)
+			if tpe == "image" || tpe == "image_url" || pm["source"] != nil {
+				t.Fatalf("image block residual: %s", body)
+			}
+		}
+	}
+}
+
+// assertVisionRequestShape 断言 vision 预处理请求只含一条 user 消息，
+// content 块数恰为 wantParts（图 N 个 + prompt 1 个）。
+func assertVisionRequestShape(t *testing.T, body string, wantParts int) {
+	t.Helper()
+	var m map[string]any
+	if err := json.Unmarshal([]byte(body), &m); err != nil {
+		t.Fatalf("unmarshal vision request: %v", err)
+	}
+	msgs, ok := m["messages"].([]any)
+	if !ok || len(msgs) != 1 {
+		t.Fatalf("vision request must have exactly 1 message: %s", body)
+	}
+	content, _ := msgs[0].(map[string]any)["content"].([]any)
+	if len(content) != wantParts {
+		t.Fatalf("vision content parts = %d, want %d: %s", len(content), wantParts, body)
+	}
+}
+
+// TestVisionPreprocess_ImageToMain：预处理模式下最新 run 图片经 vision 解析后替换进请求走 main。
+// main 收到无图 body（含 [图片内容: 图中是登录页]）；vision 只收图 + prompt（无历史文本/历史消息）。
+func TestVisionPreprocess_ImageToMain(t *testing.T) {
+	visionReq := make(chan string, 1)
+	visionSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		visionReq <- string(body)
+		w.Write([]byte(`{"choices":[{"message":{"content":"图中是登录页"}}]}`))
+	}))
+	defer visionSrv.Close()
+	mainReq := make(chan string, 1)
+	mainSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		mainReq <- string(body)
+		w.Write([]byte(claudeMockResponse("main-m", "ok")))
+	}))
+	defer mainSrv.Close()
+	ts := newVisionPreprocessProxy(t, visionSrv, mainSrv, "openai", "claude", true)
+
+	resp, data := postMessages(t, ts.URL+"/v1/messages", visionPreprocessReq)
+	if resp.StatusCode != 200 {
+		t.Fatalf("status: %d body: %s", resp.StatusCode, data)
+	}
+
+	mainBody := recvBody(t, mainReq)
+	if !strings.Contains(mainBody, "[图片内容: 图中是登录页]") {
+		t.Fatalf("main missing parsed text: %s", mainBody)
+	}
+	assertNoImageBlocks(t, mainBody)
+
+	vBody := recvBody(t, visionReq)
+	assertVisionRequestShape(t, vBody, 2)
+	if !strings.Contains(vBody, "data:image/png;base64,AAAA") {
+		t.Fatalf("vision missing image: %s", vBody)
+	}
+	if !strings.Contains(vBody, "请依次详细描述每一张图片的内容") {
+		t.Fatalf("vision missing fixed prompt: %s", vBody)
+	}
+	if !strings.Contains(vBody, "结合用户问题「hi」") {
+		t.Fatalf("vision missing user context: %s", vBody)
+	}
+}
+
+// TestVisionPreprocess_UpstreamFail：vision 上游 500 → 客户端 502（错误信封含上游信息）；
+// vision 响应不可解析（choices 空）→ 客户端 400（请求侧错误分类）。
+func TestVisionPreprocess_UpstreamFail(t *testing.T) {
+	t.Run("vision 500 -> 502", func(t *testing.T) {
+		visionSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			io.Copy(io.Discard, r.Body)
+			w.WriteHeader(500)
+			w.Write([]byte(`{"error":{"message":"vision boom"}}`))
+		}))
+		defer visionSrv.Close()
+		mainSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			t.Fatalf("main must not be called on vision failure")
+		}))
+		defer mainSrv.Close()
+		ts := newVisionPreprocessProxy(t, visionSrv, mainSrv, "openai", "claude", true)
+		resp, data := postMessages(t, ts.URL+"/v1/messages", visionPreprocessReq)
+		if resp.StatusCode != http.StatusBadGateway {
+			t.Fatalf("status: %d (want 502) body: %s", resp.StatusCode, data)
+		}
+		if !strings.Contains(string(data), "vision") || !strings.Contains(string(data), "500") {
+			t.Fatalf("error envelope missing upstream info: %s", data)
+		}
+	})
+	t.Run("vision empty choices -> 400", func(t *testing.T) {
+		visionSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			io.Copy(io.Discard, r.Body)
+			w.Write([]byte(`{"choices":[]}`))
+		}))
+		defer visionSrv.Close()
+		mainSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			t.Fatalf("main must not be called")
+		}))
+		defer mainSrv.Close()
+		ts := newVisionPreprocessProxy(t, visionSrv, mainSrv, "openai", "claude", true)
+		resp, data := postMessages(t, ts.URL+"/v1/messages", visionPreprocessReq)
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("status: %d (want 400) body: %s", resp.StatusCode, data)
+		}
+	})
+}
+
+// TestVisionPreprocess_ClaudeVisionUpstream：vision 上游为 claude 格式 → 请求含
+// max_tokens（必设）与 image block；响应 content 块解析文本回填 main。
+func TestVisionPreprocess_ClaudeVisionUpstream(t *testing.T) {
+	visionReq := make(chan string, 1)
+	visionSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		visionReq <- string(body)
+		w.Write([]byte(`{"content":[{"type":"text","text":"图中是仪表盘"}],"role":"assistant","type":"message"}`))
+	}))
+	defer visionSrv.Close()
+	mainReq := make(chan string, 1)
+	mainSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		mainReq <- string(body)
+		w.Write([]byte(claudeMockResponse("main-m", "ok")))
+	}))
+	defer mainSrv.Close()
+	ts := newVisionPreprocessProxy(t, visionSrv, mainSrv, "claude", "claude", true)
+
+	resp, data := postMessages(t, ts.URL+"/v1/messages", visionPreprocessReq)
+	if resp.StatusCode != 200 {
+		t.Fatalf("status: %d body: %s", resp.StatusCode, data)
+	}
+
+	vBody := recvBody(t, visionReq)
+	assertVisionRequestShape(t, vBody, 2)
+	if !strings.Contains(vBody, `"max_tokens":1024`) {
+		t.Fatalf("claude vision request missing max_tokens: %s", vBody)
+	}
+	if !strings.Contains(vBody, `"media_type":"image/png"`) || !strings.Contains(vBody, `"data":"AAAA"`) {
+		t.Fatalf("claude vision request missing image source: %s", vBody)
+	}
+	mainBody := recvBody(t, mainReq)
+	if !strings.Contains(mainBody, "[图片内容: 图中是仪表盘]") {
+		t.Fatalf("main missing parsed text: %s", mainBody)
+	}
+	assertNoImageBlocks(t, mainBody)
+}
+
+// TestVisionPreprocess_ContentArray：OpenAI 响应 content 为数组 → 拼接全部 text part。
+func TestVisionPreprocess_ContentArray(t *testing.T) {
+	visionSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		w.Write([]byte(`{"choices":[{"message":{"content":[{"type":"text","text":"A"},{"type":"text","text":"B"}]}}]}`))
+	}))
+	defer visionSrv.Close()
+	mainReq := make(chan string, 1)
+	mainSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		mainReq <- string(body)
+		w.Write([]byte(claudeMockResponse("main-m", "ok")))
+	}))
+	defer mainSrv.Close()
+	ts := newVisionPreprocessProxy(t, visionSrv, mainSrv, "openai", "claude", true)
+
+	resp, data := postMessages(t, ts.URL+"/v1/messages", visionPreprocessReq)
+	if resp.StatusCode != 200 {
+		t.Fatalf("status: %d body: %s", resp.StatusCode, data)
+	}
+	mainBody := recvBody(t, mainReq)
+	if !strings.Contains(mainBody, "[图片内容: AB]") {
+		t.Fatalf("content array not joined: %s", mainBody)
+	}
+}
+
+// TestVisionPreprocess_StreamPassthrough：入站 stream=true → 预处理后 main 流式透传
+// （stream 字段保留），客户端收到 SSE 结束帧。
+func TestVisionPreprocess_StreamPassthrough(t *testing.T) {
+	streamBody := "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"c\",\"content\":[]}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+	visionReq := make(chan string, 1)
+	visionSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		visionReq <- string(body)
+		w.Write([]byte(`{"choices":[{"message":{"content":"图中是登录页"}}]}`))
+	}))
+	defer visionSrv.Close()
+	mainReq := make(chan string, 1)
+	mainSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		mainReq <- string(body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		fl, _ := w.(http.Flusher)
+		w.Write([]byte(streamBody))
+		fl.Flush()
+	}))
+	defer mainSrv.Close()
+	ts := newVisionPreprocessProxy(t, visionSrv, mainSrv, "openai", "claude", true)
+
+	req := `{"model":"x","messages":[{"role":"user","content":"hi"},{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}]}],"stream":true}`
+	resp, data := postMessages(t, ts.URL+"/v1/messages", req)
+	if resp.StatusCode != 200 {
+		t.Fatalf("status: %d body: %s", resp.StatusCode, data)
+	}
+	if !strings.Contains(string(data), "message_stop") {
+		t.Fatalf("stream end frame missing: %s", data)
+	}
+	if !strings.Contains(string(data), `"text":"hi"`) {
+		t.Fatalf("stream delta missing: %s", data)
+	}
+	// 预处理照常发生（vision 收到图 + prompt），main 收到 stream 透传 + 解析文本
+	recvBody(t, visionReq)
+	mainBody := recvBody(t, mainReq)
+	var m map[string]any
+	_ = json.Unmarshal([]byte(mainBody), &m)
+	if st, _ := m["stream"].(bool); !st {
+		t.Fatalf("stream field not preserved: %s", mainBody)
+	}
+	if !strings.Contains(mainBody, "[图片内容: 图中是登录页]") {
+		t.Fatalf("preprocess not applied on stream: %s", mainBody)
+	}
+}
+
+// TestVisionPreprocess_NoUserText：run 只有图无用户文本 → vision 只收固定指令（无"结合用户问题"）。
+func TestVisionPreprocess_NoUserText(t *testing.T) {
+	visionReq := make(chan string, 1)
+	visionSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		visionReq <- string(body)
+		w.Write([]byte(`{"choices":[{"message":{"content":"纯图描述"}}]}`))
+	}))
+	defer visionSrv.Close()
+	mainSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		w.Write([]byte(claudeMockResponse("main-m", "ok")))
+	}))
+	defer mainSrv.Close()
+	ts := newVisionPreprocessProxy(t, visionSrv, mainSrv, "openai", "claude", true)
+
+	req := `{"model":"x","messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}]}]}`
+	resp, data := postMessages(t, ts.URL+"/v1/messages", req)
+	if resp.StatusCode != 200 {
+		t.Fatalf("status: %d body: %s", resp.StatusCode, data)
+	}
+	vBody := recvBody(t, visionReq)
+	if !strings.Contains(vBody, "请依次详细描述每一张图片的内容") {
+		t.Fatalf("missing fixed prompt: %s", vBody)
+	}
+	if strings.Contains(vBody, "结合用户问题") {
+		t.Fatalf("user context should be absent: %s", vBody)
+	}
+}
+
+// TestVisionPreprocess_Disabled：VisionPreprocess=false → 现有行为：整请求切 vision
+// （vision 收到含历史文本的完整请求）。
+func TestVisionPreprocess_Disabled(t *testing.T) {
+	visionReq := make(chan string, 1)
+	visionSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		visionReq <- string(body)
+		w.Write([]byte(claudeMockResponse("vision-m", "ok")))
+	}))
+	defer visionSrv.Close()
+	mainSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("main must not be called")
+	}))
+	defer mainSrv.Close()
+	ts := newVisionPreprocessProxy(t, visionSrv, mainSrv, "claude", "claude", false)
+
+	req := `{"model":"x","messages":[
+		{"role":"user","content":"历史问题"},
+		{"role":"assistant","content":"历史回答"},
+		{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}]}
+	]}`
+	resp, data := postMessages(t, ts.URL+"/v1/messages", req)
+	if resp.StatusCode != 200 {
+		t.Fatalf("status: %d body: %s", resp.StatusCode, data)
+	}
+	vBody := recvBody(t, visionReq)
+	if !strings.Contains(vBody, "历史问题") || !strings.Contains(vBody, "历史回答") {
+		t.Fatalf("vision must receive full request with history: %s", vBody)
+	}
+	if !strings.Contains(vBody, `"data":"AAAA"`) {
+		t.Fatalf("vision must receive the image: %s", vBody)
+	}
+}
+
+// TestVisionPreprocess_HistorySanitized：历史含图 + 最新 run 含图 → 历史图脱敏标记 +
+// 最新图解析文本同时进入 main（预处理与历史脱敏共存）。
+func TestVisionPreprocess_HistorySanitized(t *testing.T) {
+	visionSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if strings.Contains(string(body), "HIST") {
+			t.Fatalf("history image leaked into vision request: %s", body)
+		}
+		w.Write([]byte(`{"choices":[{"message":{"content":"最新图解析"}}]}`))
+	}))
+	defer visionSrv.Close()
+	mainReq := make(chan string, 1)
+	mainSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		mainReq <- string(body)
+		w.Write([]byte(claudeMockResponse("main-m", "ok")))
+	}))
+	defer mainSrv.Close()
+	ts := newVisionPreprocessProxy(t, visionSrv, mainSrv, "openai", "claude", true)
+
+	req := `{"model":"x","messages":[
+		{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"HIST"}}]},
+		{"role":"assistant","content":"历史图解析"},
+		{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}]}
+	]}`
+	resp, data := postMessages(t, ts.URL+"/v1/messages", req)
+	if resp.StatusCode != 200 {
+		t.Fatalf("status: %d body: %s", resp.StatusCode, data)
+	}
+	mainBody := recvBody(t, mainReq)
+	if !strings.Contains(mainBody, "[image: analyzed in previous reply]") {
+		t.Fatalf("history image not sanitized: %s", mainBody)
+	}
+	if !strings.Contains(mainBody, "[图片内容: 最新图解析]") {
+		t.Fatalf("latest parsed text missing: %s", mainBody)
+	}
+	if strings.Contains(mainBody, "HIST") || strings.Contains(mainBody, "AAAA") {
+		t.Fatalf("raw image data leaked to main: %s", mainBody)
+	}
+}
+
+// TestVisionPreprocess_URLOmittedSkipsVision：run 内 URL 图（非 base64）→ 不入 imgs、
+// 降级 [image omitted]，跳过 vision 调用直接走 main。
+func TestVisionPreprocess_URLOmittedSkipsVision(t *testing.T) {
+	visionCalled := make(chan struct{}, 1)
+	visionSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		visionCalled <- struct{}{}
+		t.Fatalf("vision must not be called for URL-only images")
+	}))
+	defer visionSrv.Close()
+	mainReq := make(chan string, 1)
+	mainSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		mainReq <- string(body)
+		w.Write([]byte(claudeMockResponse("main-m", "ok")))
+	}))
+	defer mainSrv.Close()
+	ts := newVisionPreprocessProxy(t, visionSrv, mainSrv, "openai", "claude", true)
+
+	req := `{"model":"x","messages":[{"role":"user","content":[{"type":"image","source":{"type":"url","url":"https://example.com/x.png"}}]}]}`
+	resp, data := postMessages(t, ts.URL+"/v1/messages", req)
+	if resp.StatusCode != 200 {
+		t.Fatalf("status: %d body: %s", resp.StatusCode, data)
+	}
+	mainBody := recvBody(t, mainReq)
+	if !strings.Contains(mainBody, "[image omitted]") {
+		t.Fatalf("URL image not downgraded: %s", mainBody)
+	}
+	select {
+	case <-visionCalled:
+		t.Fatal("vision was called for URL-only images")
+	default:
+	}
+}
+
+// TestVisionPreprocess_TrafficLog：logging.enabled + 注入 writer 时，预处理子请求信息
+// （vision_preprocess 标记、prompt、图数、图总字节、解析响应）写入主请求 traffic log 条目。
+func TestVisionPreprocess_TrafficLog(t *testing.T) {
+	visionSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		w.Write([]byte(`{"choices":[{"message":{"content":"图中是登录页"}}]}`))
+	}))
+	defer visionSrv.Close()
+	mainSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		w.Write([]byte(claudeMockResponse("main-m", "ok")))
+	}))
+	defer mainSrv.Close()
+
+	var buf bytes.Buffer
+	cfg := &config.Config{
+		AutoSwitchVision: true,
+		VisionPreprocess: true,
+		Logging:          config.LoggingConfig{Enabled: true},
+		Upstreams: map[string]config.UpstreamConfig{
+			"main":   {BaseURL: mainSrv.URL + "/v1", APIKey: "sk", Format: "claude", Model: "main-m"},
+			"vision": {BaseURL: visionSrv.URL + "/v1", APIKey: "sk", Format: "openai", Model: "vision-m"},
+		},
+	}
+	srv := NewWithConfig(cfg, upstream.NewClient(), slog.Default())
+	srv.SetTrafficLog(trafficlog.NewWithWriter(&buf))
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	resp, data := postMessages(t, ts.URL+"/v1/messages", visionPreprocessReq)
+	if resp.StatusCode != 200 {
+		t.Fatalf("status: %d body: %s", resp.StatusCode, data)
+	}
+	lines := bytes.Split(bytes.TrimRight(buf.Bytes(), "\n"), []byte("\n"))
+	if len(lines) != 1 {
+		t.Fatalf("want 1 traffic line, got %d: %s", len(lines), buf.String())
+	}
+	var got map[string]any
+	if err := json.Unmarshal(lines[0], &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["vision_preprocess"] != true {
+		t.Fatalf("vision_preprocess flag missing: %s", lines[0])
+	}
+	if got["vision_images"] != float64(1) {
+		t.Fatalf("vision_images: %v", got["vision_images"])
+	}
+	if got["vision_image_bytes"] != float64(4) { // base64 "AAAA"
+		t.Fatalf("vision_image_bytes: %v", got["vision_image_bytes"])
+	}
+	prompt, _ := got["vision_prompt"].(string)
+	if !strings.Contains(prompt, "请依次详细描述每一张图片的内容") || !strings.Contains(prompt, "结合用户问题「hi」") {
+		t.Fatalf("vision_prompt: %q", prompt)
+	}
+	if got["vision_response"] != "图中是登录页" {
+		t.Fatalf("vision_response: %v", got["vision_response"])
 	}
 }

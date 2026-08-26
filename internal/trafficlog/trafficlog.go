@@ -153,6 +153,13 @@ type Entry struct {
 	UpstreamResponse string `json:"upstream_response"`
 	OutboundResponse string `json:"outbound_response"`
 	Error            string `json:"error"`
+
+	// Vision 预处理子请求信息（仅预处理请求设置；omitempty 非预处理条目不带）
+	VisionPreprocess bool   `json:"vision_preprocess,omitempty"`
+	VisionPrompt     string `json:"vision_prompt,omitempty"`
+	VisionImages     int    `json:"vision_images,omitempty"`
+	VisionImageBytes int    `json:"vision_image_bytes,omitempty"`
+	VisionResponse   string `json:"vision_response,omitempty"`
 }
 
 // TrafficLog 内容日志 writer：JSONL 追加写，lumberjack 按大小轮转。
@@ -221,6 +228,12 @@ type Recorder struct {
 	outboundBody     *segBuffer
 	upstreamResponse *segBuffer
 	outboundResponse *segBuffer
+
+	// vision 预处理子请求信息（SetVisionPreprocess 填充）
+	visionPrompt     string
+	visionImages     int
+	visionImageBytes int
+	visionResponse   string
 }
 
 func NewRecorder(dir, requestID, inbound string) *Recorder {
@@ -240,6 +253,15 @@ func (r *Recorder) RequestID() string { return r.requestID }
 
 func (r *Recorder) SetDecision(upstream, outbound, model string) {
 	r.upstream, r.outbound, r.model = upstream, outbound, model
+}
+
+// SetVisionPreprocess 记录 vision 预处理子请求信息（prompt、图数、图总字节、解析响应）。
+// response 在解析成功后才填充；失败（或未调用）保持空串，便于区分。
+func (r *Recorder) SetVisionPreprocess(prompt string, images, imageBytes int, response string) {
+	r.visionPrompt = prompt
+	r.visionImages = images
+	r.visionImageBytes = imageBytes
+	r.visionResponse = response
 }
 
 func (r *Recorder) SetInbound(body []byte)          { _, _ = r.inboundBody.Write(body) }
@@ -285,6 +307,12 @@ func (r *Recorder) Entry(stream bool, duration time.Duration) Entry {
 		UpstreamResponse: string(Redact([]byte(upRaw))),
 		OutboundResponse: string(Redact([]byte(outRaw))),
 		Error:            r.errMsg,
+
+		VisionPreprocess: r.visionPrompt != "" || r.visionImages > 0,
+		VisionPrompt:     r.visionPrompt,
+		VisionImages:     r.visionImages,
+		VisionImageBytes: r.visionImageBytes,
+		VisionResponse:   r.visionResponse,
 	}
 }
 
