@@ -14,12 +14,12 @@ func OpenAIResponseToClaude(resp *ChatCompletionResponse, id string) (*MessagesR
 		// thinking 只在最前且仅一次（取自 Choices[0]，与 finish_reason/usage 的
 		// 约定一致）。usage.reasoning_tokens 故意忽略：Claude usage 无对应字段。
 		if rc := strings.TrimSpace(resp.Choices[0].Message.ReasoningContent); rc != "" {
-			blocks = append(blocks, ClaudeBlock{Type: "thinking", Thinking: rc})
+			blocks = append(blocks, ClaudeBlock{Type: "thinking", Thinking: &rc, Signature: thinkingSigPlaceholder})
 		}
 	}
 	for _, ch := range resp.Choices {
 		if s := contentString(ch.Message.Content); s != "" {
-			blocks = append(blocks, ClaudeBlock{Type: "text", Text: s})
+			blocks = append(blocks, ClaudeBlock{Type: "text", Text: &s})
 		}
 		for _, tc := range ch.Message.ToolCalls {
 			input, perr := OpenAIArgsToClaudeInput(tc.Function.Arguments)
@@ -56,7 +56,7 @@ func ClaudeResponseToOpenAI(resp *MessagesResponse, id string) (*ChatCompletionR
 	for _, b := range resp.Content {
 		switch b.Type {
 		case "text":
-			text.WriteString(b.Text)
+			text.WriteString(*b.Text)
 		case "tool_use":
 			args, err := ClaudeInputToOpenAIArgs(b.Input)
 			if err != nil {

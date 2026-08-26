@@ -38,8 +38,8 @@ func TestOpenAIResponseToClaude(t *testing.T) {
 func TestClaudeResponseToOpenAI_ThinkingStripped(t *testing.T) {
 	resp := &MessagesResponse{
 		Content: []ClaudeBlock{
-			{Type: "thinking", Thinking: "secret"},
-			{Type: "text", Text: "answer"},
+			{Type: "thinking", Thinking: strPtr("secret")},
+			{Type: "text", Text: strPtr("answer")},
 			{Type: "tool_use", ID: "toolu_1", Name: "f", Input: map[string]any{"x": 1}},
 		},
 		StopReason: strPtr("tool_use"),
@@ -81,7 +81,7 @@ func TestClaudeResponseToOpenAI_NilImageSource(t *testing.T) {
 		Content: []ClaudeBlock{
 			{Type: "image"},
 			{Type: "image", Source: &ImageSource{Type: "base64", MediaType: "image/png"}}, // 缺 data
-			{Type: "text", Text: "answer"},
+			{Type: "text", Text: strPtr("answer")},
 		},
 	}
 	out, err := ClaudeResponseToOpenAI(resp, "")
@@ -108,10 +108,10 @@ func TestOpenAIResponseToClaude_ReasoningMapped(t *testing.T) {
 	if len(out.Content) != 3 {
 		t.Fatalf("want 3 blocks, got %d: %+v", len(out.Content), out.Content)
 	}
-	if out.Content[0].Type != "thinking" || out.Content[0].Thinking != "think step by step" {
+	if out.Content[0].Type != "thinking" || *out.Content[0].Thinking != "think step by step" {
 		t.Fatalf("first block must be thinking: %+v", out.Content[0])
 	}
-	if out.Content[1].Type != "text" || out.Content[1].Text != "hi" {
+	if out.Content[1].Type != "text" || *out.Content[1].Text != "hi" {
 		t.Fatalf("second block must be text: %+v", out.Content[1])
 	}
 	if out.Content[2].Type != "tool_use" {
@@ -125,7 +125,7 @@ func TestOpenAIResponseToClaude_ReasoningOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(out.Content) != 1 || out.Content[0].Type != "thinking" || out.Content[0].Thinking != "only thinking" {
+	if len(out.Content) != 1 || out.Content[0].Type != "thinking" || *out.Content[0].Thinking != "only thinking" {
 		t.Fatalf("want only thinking: %+v", out.Content)
 	}
 }
@@ -145,7 +145,7 @@ func TestOpenAIResponseToClaude_MultiChoiceThinkingOnce(t *testing.T) {
 	if len(out.Content) != 3 {
 		t.Fatalf("want 3 blocks: %+v", out.Content)
 	}
-	if out.Content[0].Type != "thinking" || out.Content[0].Thinking != "r1" {
+	if out.Content[0].Type != "thinking" || *out.Content[0].Thinking != "r1" {
 		t.Fatalf("thinking once first: %+v", out.Content[0])
 	}
 	if out.Content[1].Type != "text" || out.Content[2].Type != "text" {

@@ -53,7 +53,7 @@ func TestClaudeMessagesToOpenAI_ToolResultOrder(t *testing.T) {
 	msgs := []ClaudeMessage{
 		{Role: "user", Content: []ClaudeBlock{
 			{Type: "tool_result", Content: "r"},
-			{Type: "text", Text: "and also"},
+			{Type: "text", Text: strPtr("and also")},
 		}},
 	}
 	out, err := ClaudeMessagesToOpenAI(msgs, "")
@@ -121,7 +121,7 @@ func TestClaudeMessagesToOpenAI_Contract(t *testing.T) {
 		},
 		{
 			name: "tool_result array content concatenated",
-			msgs: []ClaudeMessage{{Role: "user", Content: []ClaudeBlock{{Type: "tool_result", ToolUseID: "c1", Content: []ClaudeBlock{{Type: "text", Text: "a"}, {Type: "text", Text: "b"}}}}}},
+			msgs: []ClaudeMessage{{Role: "user", Content: []ClaudeBlock{{Type: "tool_result", ToolUseID: "c1", Content: []ClaudeBlock{{Type: "text", Text: strPtr("a")}, {Type: "text", Text: strPtr("b")}}}}}},
 			want: []ChatMessage{{Role: "tool", ToolCallID: "c1", Content: "ab"}},
 		},
 		{
@@ -131,7 +131,7 @@ func TestClaudeMessagesToOpenAI_Contract(t *testing.T) {
 		},
 		{
 			name: "thinking stripped",
-			msgs: []ClaudeMessage{{Role: "assistant", Content: []ClaudeBlock{{Type: "thinking", Thinking: "private"}, {Type: "redacted_thinking", Thinking: "secret"}, {Type: "text", Text: "hi"}}}},
+			msgs: []ClaudeMessage{{Role: "assistant", Content: []ClaudeBlock{{Type: "thinking", Thinking: strPtr("private")}, {Type: "redacted_thinking", Thinking: strPtr("secret")}, {Type: "text", Text: strPtr("hi")}}}},
 			want: []ChatMessage{{Role: "assistant", Content: "hi"}},
 		},
 		{
@@ -201,7 +201,7 @@ func TestImageConversions(t *testing.T) {
 // 含图消息 content 输出为 []ContentPart 数组。
 func TestClaudeMessagesToOpenAI_Image(t *testing.T) {
 	msgs := []ClaudeMessage{{Role: "user", Content: []ClaudeBlock{
-		{Type: "text", Text: "what is this"},
+		{Type: "text", Text: strPtr("what is this")},
 		{Type: "image", Source: &ImageSource{Type: "base64", MediaType: "image/png", Data: "iVBORw0KGgo="}},
 	}}}
 	out, err := ClaudeMessagesToOpenAI(msgs, "")
@@ -327,7 +327,7 @@ func TestContentHasImage(t *testing.T) {
 		parts any
 		want  bool
 	}{
-		{"claude blocks no image", []ClaudeBlock{{Type: "text", Text: "x"}}, false},
+		{"claude blocks no image", []ClaudeBlock{{Type: "text", Text: strPtr("x")}}, false},
 		{"claude blocks image", []ClaudeBlock{{Type: "image", Source: &ImageSource{Type: "base64", Data: "x"}}}, true},
 		{"any text", []any{map[string]any{"type": "text", "text": "x"}}, false},
 		{"any image_url", []any{map[string]any{"type": "image_url"}}, true},

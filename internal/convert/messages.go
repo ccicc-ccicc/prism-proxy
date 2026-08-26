@@ -49,7 +49,7 @@ func OpenAIMessagesToClaude(msgs []ChatMessage) (system string, out []ClaudeMess
 			flushPending(&out, &pendingText)
 			var blocks []ClaudeBlock
 			if s := contentString(m.Content); s != "" {
-				blocks = append(blocks, ClaudeBlock{Type: "text", Text: s})
+				blocks = append(blocks, ClaudeBlock{Type: "text", Text: &s})
 			}
 			for _, tc := range m.ToolCalls {
 				input, perr := OpenAIArgsToClaudeInput(tc.Function.Arguments)
@@ -121,7 +121,8 @@ func convertOpenAIContent(c any) any {
 		}
 		switch pp["type"] {
 		case "text":
-			blocks = append(blocks, ClaudeBlock{Type: "text", Text: fmt.Sprint(pp["text"])})
+			ts := fmt.Sprint(pp["text"])
+			blocks = append(blocks, ClaudeBlock{Type: "text", Text: &ts})
 		case "image_url":
 			u, _ := pp["image_url"].(map[string]any)
 			urlStr, _ := u["url"].(string)

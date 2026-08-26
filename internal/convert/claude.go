@@ -2,6 +2,14 @@ package convert
 
 // Anthropic Messages API 结构。
 
+// thinkingSigPlaceholder OpenAI 上游无签名（reasoning_content 不带 Anthropic
+// signature）。客户端 SDK（Claude Code 等）要求 thinking 块 signature 非空，
+// 否则解析崩溃/挂起；第三方模型下 SDK 不校验签名内容，仅要求存在。
+const thinkingSigPlaceholder = "proxy-generated"
+
+// emptyStr 块 start 帧的空值初值（text/thinking 的 SDK 累加起点，须非 None）。
+var emptyStr = ""
+
 const (
 	EventMessageStart      = "message_start"
 	EventContentBlockStart = "content_block_start"
@@ -35,8 +43,10 @@ type ClaudeMessage struct {
 }
 
 type ClaudeBlock struct {
-	Type        string       `json:"type"`
-	Text        string       `json:"text,omitempty"`
+	Type string `json:"type"`
+	// Text/Thinking *string：start 帧须显式输出空值初值（SDK 以 start 帧字段为
+	// 初值累加 delta，None 即崩溃）。
+	Text        *string      `json:"text,omitempty"`
 	ID          string       `json:"id,omitempty"`
 	Name        string       `json:"name,omitempty"`
 	Input       any          `json:"input,omitempty"`
@@ -44,7 +54,7 @@ type ClaudeBlock struct {
 	ToolUseID   string       `json:"tool_use_id,omitempty"`
 	IsError     *bool        `json:"is_error,omitempty"`
 	Source      *ImageSource `json:"source,omitempty"`
-	Thinking    string       `json:"thinking,omitempty"`
+	Thinking    *string      `json:"thinking,omitempty"`
 	Signature   string       `json:"signature,omitempty"`
 	PartialJSON string       `json:"partial_json,omitempty"`
 }
@@ -90,14 +100,16 @@ type ClaudeError struct {
 }
 
 type StreamEvent struct {
-	Type         string            `json:"type"`
-	Message      *MessagesResponse `json:"message,omitempty"`
-	Index        int               `json:"index,omitempty"`
-	ContentBlock *ClaudeBlock      `json:"content_block,omitempty"`
-	Delta        *ClaudeDelta      `json:"delta,omitempty"`
-	Usage        *ClaudeUsage      `json:"usage,omitempty"`
-	StopReason   *string           `json:"stop_reason,omitempty"`
-	Error        *ClaudeError      `json:"error,omitempty"`
+	Type    string            `json:"type"`
+	Message *MessagesResponse `json:"message,omitempty"`
+	// Index 仅 content 级事件携带（content_block_start/delta/stop），指针保证
+	// index=0 也序列化（SDK 按 index 索引 content 数组，缺失即崩溃）。
+	Index        *int         `json:"index,omitempty"`
+	ContentBlock *ClaudeBlock `json:"content_block,omitempty"`
+	Delta        *ClaudeDelta `json:"delta,omitempty"`
+	Usage        *ClaudeUsage `json:"usage,omitempty"`
+	StopReason   *string      `json:"stop_reason,omitempty"`
+	Error        *ClaudeError `json:"error,omitempty"`
 }
 
 // ClaudeDelta 同时服务两类 delta：

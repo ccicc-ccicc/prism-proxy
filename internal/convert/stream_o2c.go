@@ -71,50 +71,51 @@ func (s *O2CStream) Write(data []byte) ([][]byte, error) {
 	if rc := delta.ReasoningContent; strings.TrimSpace(rc) != "" && !s.inText && !s.inTool {
 		if !s.inThinking {
 			s.inThinking = true
-			frames = append(frames, s.frame(EventContentBlockStart, StreamEvent{Index: s.blockIdx, ContentBlock: &ClaudeBlock{Type: "thinking"}}))
+			frames = append(frames, s.frame(EventContentBlockStart, StreamEvent{Index: &s.blockIdx, ContentBlock: &ClaudeBlock{Type: "thinking", Thinking: &emptyStr, Signature: thinkingSigPlaceholder}}))
 		}
-		frames = append(frames, s.frame(EventContentBlockDelta, StreamEvent{Index: s.blockIdx, Delta: &ClaudeDelta{Type: "thinking_delta", Thinking: rc}}))
+		frames = append(frames, s.frame(EventContentBlockDelta, StreamEvent{Index: &s.blockIdx, Delta: &ClaudeDelta{Type: "thinking_delta", Thinking: rc}}))
 	}
 	if text, ok := delta.Content.(string); ok && text != "" {
 		if s.inTool || s.inThinking {
 			// 块切换（tool_use/thinking → text）：先关当前块并递增 index
-			frames = append(frames, s.frame(EventContentBlockStop, StreamEvent{Index: s.blockIdx}))
+			frames = append(frames, s.frame(EventContentBlockStop, StreamEvent{Index: &s.blockIdx}))
 			s.inText, s.inTool, s.inThinking = false, false, false
 			s.blockIdx++
 		}
 		if !s.inText && !s.inTool && !s.inThinking {
 			s.inText = true
-			frames = append(frames, s.frame(EventContentBlockStart, StreamEvent{Index: s.blockIdx, ContentBlock: &ClaudeBlock{Type: "text"}}))
+			frames = append(frames, s.frame(EventContentBlockStart, StreamEvent{Index: &s.blockIdx, ContentBlock: &ClaudeBlock{Type: "text", Text: &emptyStr}}))
 		}
-		frames = append(frames, s.frame(EventContentBlockDelta, StreamEvent{Index: s.blockIdx, Delta: &ClaudeDelta{Type: "text_delta", Text: text}}))
+		frames = append(frames, s.frame(EventContentBlockDelta, StreamEvent{Index: &s.blockIdx, Delta: &ClaudeDelta{Type: "text_delta", Text: text}}))
 	}
 	for _, tc := range delta.ToolCalls {
 		if tc.ID != "" && tc.Function.Name != "" {
 			if s.inText || s.inTool || s.inThinking {
-				frames = append(frames, s.frame(EventContentBlockStop, StreamEvent{Index: s.blockIdx}))
+				frames = append(frames, s.frame(EventContentBlockStop, StreamEvent{Index: &s.blockIdx}))
 				s.inText, s.inTool, s.inThinking = false, false, false
 				s.blockIdx++
 			}
 			s.inTool = true
-			frames = append(frames, s.frame(EventContentBlockStart, StreamEvent{Index: s.blockIdx, ContentBlock: &ClaudeBlock{Type: "tool_use", ID: tc.ID, Name: tc.Function.Name, Input: map[string]any{}}}))
+			frames = append(frames, s.frame(EventContentBlockStart, StreamEvent{Index: &s.blockIdx, ContentBlock: &ClaudeBlock{Type: "tool_use", ID: tc.ID, Name: tc.Function.Name, Input: map[string]any{}}}))
 			if tc.Function.Arguments != "" {
-				frames = append(frames, s.frame(EventContentBlockDelta, StreamEvent{Index: s.blockIdx, Delta: &ClaudeDelta{Type: "input_json_delta", PartialJSON: tc.Function.Arguments}}))
+				frames = append(frames, s.frame(EventContentBlockDelta, StreamEvent{Index: &s.blockIdx, Delta: &ClaudeDelta{Type: "input_json_delta", PartialJSON: tc.Function.Arguments}}))
 			}
 			continue
 		}
 		if s.inTool && tc.Function.Arguments != "" {
-			frames = append(frames, s.frame(EventContentBlockDelta, StreamEvent{Index: s.blockIdx, Delta: &ClaudeDelta{Type: "input_json_delta", PartialJSON: tc.Function.Arguments}}))
+			frames = append(frames, s.frame(EventContentBlockDelta, StreamEvent{Index: &s.blockIdx, Delta: &ClaudeDelta{Type: "input_json_delta", PartialJSON: tc.Function.Arguments}}))
 		}
 	}
 	if fr := chunk.Choices[0].FinishReason; fr != nil && !s.sentStop {
 		s.sentStop = true
 		if s.inText || s.inTool || s.inThinking {
-			frames = append(frames, s.frame(EventContentBlockStop, StreamEvent{Index: s.blockIdx}))
+			frames = append(frames, s.frame(EventContentBlockStop, StreamEvent{Index: &s.blockIdx}))
 			s.inText, s.inTool, s.inThinking = false, false, false
 		}
 		// Anthropic 真实 message_delta：stop_reason 嵌套在 delta 内
-		// （{"delta":{"stop_reason":"end_turn"}}），usage 可同帧携带
-		ev := StreamEvent{Delta: &ClaudeDelta{StopReason: stopReasonO2C(*fr)}}
+		// （{"delta":{"stop_reason":"end_turn"}}），usage 恒携带
+		// （SDK 无条件读取 event.usage.output_tokens；上游无 usage 时给零值）
+		ev := StreamEvent{Delta: &ClaudeDelta{StopReason: stopReasonO2C(*fr)}, Usage: &ClaudeUsage{}}
 		if chunk.Usage != nil {
 			ev.Usage = &ClaudeUsage{InputTokens: chunk.Usage.PromptTokens, OutputTokens: chunk.Usage.CompletionTokens}
 		}
@@ -133,7 +134,7 @@ func (s *O2CStream) Finish() [][]byte {
 	s.done = true
 	if s.inText || s.inTool || s.inThinking {
 		s.inText, s.inTool, s.inThinking = false, false, false
-		return [][]byte{s.frame(EventContentBlockStop, StreamEvent{Index: s.blockIdx}), s.frame(EventMessageStop, StreamEvent{})}
+		return [][]byte{s.frame(EventContentBlockStop, StreamEvent{Index: &s.blockIdx}), s.frame(EventMessageStop, StreamEvent{})}
 	}
 	return [][]byte{s.frame(EventMessageStop, StreamEvent{})}
 }

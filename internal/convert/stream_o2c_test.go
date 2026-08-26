@@ -6,6 +6,14 @@ import (
 	"testing"
 )
 
+// idx 解引用 content 级事件 index（缺省返回 -1，断言用）。
+func idx(i *int) int {
+	if i == nil {
+		return -1
+	}
+	return *i
+}
+
 // decodeEvent 从一帧 SSE 中解出 data 行的 StreamEvent 负载。
 func decodeEvent(t *testing.T, f []byte) StreamEvent {
 	t.Helper()
@@ -99,7 +107,7 @@ func TestO2CStream_BlockIndices(t *testing.T) {
 		t.Fatalf("text write frames: %d", len(out))
 	}
 	textStart := decodeEvent(t, out[0])
-	if textStart.ContentBlock == nil || textStart.ContentBlock.Type != "text" || textStart.Index != 0 {
+	if textStart.ContentBlock == nil || textStart.ContentBlock.Type != "text" || idx(textStart.Index) != 0 {
 		t.Fatalf("text block start must be index 0: %+v", textStart)
 	}
 	// text 块先收 content_block_stop，随后 tool_use 使用全局 index 1
@@ -108,7 +116,7 @@ func TestO2CStream_BlockIndices(t *testing.T) {
 		t.Fatalf("text stop before tool start: %s", out)
 	}
 	toolStart := decodeEvent(t, out[1])
-	if toolStart.ContentBlock == nil || toolStart.ContentBlock.Type != "tool_use" || toolStart.Index != 1 {
+	if toolStart.ContentBlock == nil || toolStart.ContentBlock.Type != "tool_use" || idx(toolStart.Index) != 1 {
 		t.Fatalf("tool_use index must be 1: %+v", toolStart)
 	}
 }
@@ -174,7 +182,7 @@ func TestO2CStream_ToolOnlyIndexZero(t *testing.T) {
 		t.Fatalf("tool-only start frames: %d (%s)", len(out), out)
 	}
 	start := decodeEvent(t, out[1])
-	if start.ContentBlock == nil || start.ContentBlock.Type != "tool_use" || start.Index != 0 {
+	if start.ContentBlock == nil || start.ContentBlock.Type != "tool_use" || idx(start.Index) != 0 {
 		t.Fatalf("first tool block must be index 0: %+v", start)
 	}
 }
@@ -189,7 +197,7 @@ func TestO2CStream_MultiToolCallsSameChunk(t *testing.T) {
 		t.Fatalf("multi tool frames: %d (%s)", len(out), out)
 	}
 	start1 := decodeEvent(t, out[1])
-	if start1.ContentBlock == nil || start1.ContentBlock.Type != "tool_use" || start1.Index != 0 {
+	if start1.ContentBlock == nil || start1.ContentBlock.Type != "tool_use" || idx(start1.Index) != 0 {
 		t.Fatalf("first tool start: %+v", start1)
 	}
 	argsDelta := decodeEvent(t, out[2])
@@ -200,7 +208,7 @@ func TestO2CStream_MultiToolCallsSameChunk(t *testing.T) {
 		t.Fatalf("stop between tool blocks: %s", out[3])
 	}
 	start2 := decodeEvent(t, out[4])
-	if start2.ContentBlock == nil || start2.ContentBlock.Type != "tool_use" || start2.Index != 1 {
+	if start2.ContentBlock == nil || start2.ContentBlock.Type != "tool_use" || idx(start2.Index) != 1 {
 		t.Fatalf("second tool start: %+v", start2)
 	}
 }
@@ -358,7 +366,7 @@ func TestO2CStream_ToolThenText(t *testing.T) {
 		t.Fatalf("tool block must close: %s", out[0])
 	}
 	textStart := decodeEvent(t, out[1])
-	if textStart.ContentBlock == nil || textStart.ContentBlock.Type != "text" || textStart.Index != 1 {
+	if textStart.ContentBlock == nil || textStart.ContentBlock.Type != "text" || idx(textStart.Index) != 1 {
 		t.Fatalf("text block must be index 1: %+v", textStart)
 	}
 	delta := decodeEvent(t, out[2])
@@ -378,7 +386,7 @@ func TestO2CStream_TextContinuationNoSplit(t *testing.T) {
 		t.Fatalf("continuation frames: %d (%s)", len(out), out)
 	}
 	ev := decodeEvent(t, out[0])
-	if ev.Index != 0 || ev.Delta == nil || ev.Delta.Type != "text_delta" || ev.Delta.Text != "there" {
+	if idx(ev.Index) != 0 || ev.Delta == nil || ev.Delta.Type != "text_delta" || ev.Delta.Text != "there" {
 		t.Fatalf("continuation delta: %+v", ev)
 	}
 }
@@ -392,7 +400,7 @@ func TestO2CStream_ReasoningThenText(t *testing.T) {
 		t.Fatalf("reasoning start frames: %d (%s)", len(out), out)
 	}
 	start := decodeEvent(t, out[0])
-	if start.ContentBlock == nil || start.ContentBlock.Type != "thinking" || start.Index != 0 {
+	if start.ContentBlock == nil || start.ContentBlock.Type != "thinking" || idx(start.Index) != 0 {
 		t.Fatalf("thinking block must be index 0: %+v", start)
 	}
 	delta := decodeEvent(t, out[1])
@@ -408,7 +416,7 @@ func TestO2CStream_ReasoningThenText(t *testing.T) {
 		t.Fatalf("thinking must close: %s", out[0])
 	}
 	textStart := decodeEvent(t, out[1])
-	if textStart.ContentBlock == nil || textStart.ContentBlock.Type != "text" || textStart.Index != 1 {
+	if textStart.ContentBlock == nil || textStart.ContentBlock.Type != "text" || idx(textStart.Index) != 1 {
 		t.Fatalf("text block must be index 1: %+v", textStart)
 	}
 }
@@ -448,7 +456,7 @@ func TestO2CStream_ReasoningContinuationNoSplit(t *testing.T) {
 		t.Fatalf("continuation frames: %d (%s)", len(out), out)
 	}
 	ev := decodeEvent(t, out[0])
-	if ev.Index != 0 || ev.Delta == nil || ev.Delta.Type != "thinking_delta" || ev.Delta.Thinking != "b" {
+	if idx(ev.Index) != 0 || ev.Delta == nil || ev.Delta.Type != "thinking_delta" || ev.Delta.Thinking != "b" {
 		t.Fatalf("continuation delta: %+v", ev)
 	}
 }
@@ -463,7 +471,7 @@ func TestO2CStream_ReasoningThenTool(t *testing.T) {
 		t.Fatalf("thinking must close before tool start: %s", out)
 	}
 	toolStart := decodeEvent(t, out[1])
-	if toolStart.ContentBlock == nil || toolStart.ContentBlock.Type != "tool_use" || toolStart.Index != 1 {
+	if toolStart.ContentBlock == nil || toolStart.ContentBlock.Type != "tool_use" || idx(toolStart.Index) != 1 {
 		t.Fatalf("tool_use must be index 1 after thinking: %+v", toolStart)
 	}
 }
@@ -478,7 +486,7 @@ func TestO2CStream_ReasoningAndContentSameChunk(t *testing.T) {
 		t.Fatalf("same-chunk frames: %d (%s)", len(out), out)
 	}
 	start := decodeEvent(t, out[0])
-	if start.ContentBlock == nil || start.ContentBlock.Type != "thinking" || start.Index != 0 {
+	if start.ContentBlock == nil || start.ContentBlock.Type != "thinking" || idx(start.Index) != 0 {
 		t.Fatalf("frame 0 must be thinking start idx 0: %+v", start)
 	}
 	thinkDelta := decodeEvent(t, out[1])
@@ -489,7 +497,7 @@ func TestO2CStream_ReasoningAndContentSameChunk(t *testing.T) {
 		t.Fatalf("frame 2 must be thinking stop: %s", out[2])
 	}
 	textStart := decodeEvent(t, out[3])
-	if textStart.ContentBlock == nil || textStart.ContentBlock.Type != "text" || textStart.Index != 1 {
+	if textStart.ContentBlock == nil || textStart.ContentBlock.Type != "text" || idx(textStart.Index) != 1 {
 		t.Fatalf("frame 3 must be text start idx 1: %+v", textStart)
 	}
 	textDelta := decodeEvent(t, out[4])
