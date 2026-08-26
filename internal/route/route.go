@@ -68,3 +68,90 @@ func RequestHasImage(format string, body []byte) (bool, error) {
 		return false, fmt.Errorf("unknown format %q", format)
 	}
 }
+func EnsureThinkingBlocks(format string, body []byte) ([]byte, bool, error) {
+	if format != "claude" {
+		return body, false, nil
+	}
+	var root map[string]any
+	if err := json.Unmarshal(body, &root); err != nil {
+		return nil, false, fmt.Errorf("parse %s request: %w", format, err)
+	}
+	msgs, ok := root["messages"].([]any)
+	if !ok {
+		return nil, false, fmt.Errorf("parse %s request: missing messages", format)
+	}
+	// thinking 模式判定：顶层 thinking 参数存在，或历史含 thinking 块
+	thinkingMode := root["thinking"] != nil
+	if !thinkingMode {
+		for _, m := range msgs {
+			if msgHasThinking(m) {
+				thinkingMode = true
+				break
+			}
+		}
+	}
+	if !thinkingMode {
+		return body, false, nil
+	}
+	changed := false
+	for _, m := range msgs {
+		mm, ok := m.(map[string]any)
+		if !ok {
+			continue
+		}
+		role, _ := mm["role"].(string)
+		if role != "assistant" {
+			continue
+		}
+		content, ok := mm["content"].([]any)
+		if !ok {
+			continue
+		}
+		hasThinking, hasToolUse := false, false
+		for _, b := range content {
+			bm, ok := b.(map[string]any)
+			if !ok {
+				continue
+			}
+			switch bm["type"] {
+			case "thinking":
+				hasThinking = true
+			case "tool_use":
+				hasToolUse = true
+			}
+		}
+		if hasToolUse && !hasThinking {
+			content = append([]any{map[string]any{"type": "thinking", "thinking": ""}}, content...)
+			mm["content"] = content
+			changed = true
+		}
+	}
+	if !changed {
+		return body, false, nil
+	}
+	out, err := json.Marshal(root)
+	if err != nil {
+		return nil, false, fmt.Errorf("marshal %s request: %w", format, err)
+	}
+	return out, true, nil
+}
+func msgHasThinking(m any) bool {
+	mm, ok := m.(map[string]any)
+	if !ok {
+		return false
+	}
+	content, ok := mm["content"].([]any)
+	if !ok {
+		return false
+	}
+	for _, b := range content {
+		bm, ok := b.(map[string]any)
+		if !ok {
+			continue
+		}
+		if bm["type"] == "thinking" {
+			return true
+		}
+	}
+	return false
+}
